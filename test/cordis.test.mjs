@@ -10,11 +10,12 @@ import { pathToFileURL } from "node:url";
  * The host half against a *real* Cordis runtime.
  *
  * `test/host.test.mjs` drives this plugin with a fake Context: fast, and it
- * covers everything the plugin itself decides. But a fake cannot answer the one
- * question the tool switches rest on — whether an effect created *after* `apply`
- * has returned is really owned by this plugin, really disposes the registration
- * inside it, and can really be created again for the same tool name. Those are
- * properties of Cordis, not of this plugin, so this file boots the real
+ * covers everything the plugin itself decides. But a fake cannot answer the
+ * questions ownership rests on — whether a tool this plugin registers is really
+ * owned by this plugin's fiber, and whether an effect created *after* `apply`
+ * has returned (the read guard, toggled from the panel) really disposes what is
+ * inside it. Those are properties of Cordis, not of this plugin, so this file
+ * boots the real
  * `@deepseek-ai/cordis` with the real `@deepseek-ai/dsh-tools` registry and
  * stand-ins for the two registries the plugin consumes.
  *
@@ -98,7 +99,7 @@ async function request(route, options = {}) {
   return { status: captured.status, headers: captured.headers ?? {}, json: captured.body === undefined ? null : JSON.parse(String(captured.body)) };
 }
 
-test("tool switches hold under real Cordis ownership", { skip }, async () => {
+test("the memo tool and its routes hold under real Cordis ownership", { skip }, async () => {
   const base = mkdtempSync(join(tmpdir(), "memo-cordis-"));
   const routes = [];
   const ctx = new Context();
@@ -107,47 +108,53 @@ test("tool switches hold under real Cordis ownership", { skip }, async () => {
     await ctx.plugin(Tools, {});
     await ctx.plugin(provider("systemPrompt", systemPrompt), {});
     await ctx.plugin(provider("webServer", { register: (route) => (routes.push(route), () => {}) }), {});
-    // One tool pinned off by the composition, so the very first registration is
-    // also the one a later switch has to be able to add.
-    const fiber = await ctx.plugin(host, { tools: { memo_status: false } });
+    // One command pinned off by the composition, which is what a switch has to
+    // be able to turn back on afterwards.
+    const fiber = await ctx.plugin(host, { subcommands: { scan: false } });
 
     /** What the model would be offered right now. */
     const offered = () => ctx.tools.schemas().map((schema) => schema.name).sort();
     assert.deepEqual(routes.map((route) => route.path).sort(), ["/memo/config", "/memo/scan", "/memo/state"]);
-    assert.equal(offered().length, 7, "a tool switched off at boot is not registered at all");
-    assert.ok(!offered().includes("memo_status"));
+    assert.deepEqual(offered(), ["memo"], "one tool, whatever the switches say");
 
+    const exec = { agent: { session: { header: { cwd: base }, id: "s1" } } };
+    const memo = (command) => ctx.tools.get("memo").execute({ command }, exec);
+
+    // The tool is really registered, and really executes.
+    assert.match(await memo("status"), /还没有 \.memo\/STATUS\.md/);
+
+    // The pinned-off command is refused by the host, not by the model's manners.
+    assert.match(await memo("scan"), /被关掉了/);
+
+    // Turn it on from the panel and the same call does the work.
     const config = routes.find((route) => route.path === "/memo/config");
-    const on = await request(config, { method: "POST", body: JSON.stringify({ tools: { memo_status: true } }) });
+    const on = await request(config, { method: "POST", body: JSON.stringify({ subcommands: { scan: true } }) });
     assert.equal(on.status, 200);
-    assert.equal(offered().length, 8);
-    // Not merely present: the same definition, and it still runs.
-    assert.match(await ctx.tools.get("memo_status").execute({}, { agent: { session: { header: { cwd: base }, id: "s1" } } }), /还没有 \.memo\/STATUS\.md/);
+    assert.match(await memo("scan"), /已重建索引/);
 
     // Several at once, and the answer to the panel is the live state.
-    const off = await request(config, { method: "POST", body: JSON.stringify({ tools: { memo_status: false, memo_handoff: false } }) });
+    const off = await request(config, { method: "POST", body: JSON.stringify({ subcommands: { scan: false, handoff: false } }) });
     assert.equal(off.status, 200);
-    assert.equal(offered().length, 6);
-    assert.deepEqual(off.json.config.tools[0], {
+    assert.deepEqual(off.json.config.subcommands[0], {
       id: "memory",
-      tools: [
-        { name: "memo_status", on: false },
-        { name: "memo_handoff", on: false },
-        { name: "memo_note", on: true },
+      commands: [
+        { name: "status", on: true },
+        { name: "handoff", on: false },
+        { name: "note", on: true },
       ],
     });
+    assert.match(await memo("handoff --now x"), /被关掉了/);
 
     // The panel's own state route reports the same switch, through the route
     // the browser actually calls.
     const panel = await request(routes.find((route) => route.path === "/memo/state"), { url: `/memo/state?root=${encodeURIComponent(base)}` });
-    assert.equal(panel.json.config.tools[0].tools[0].on, false);
+    assert.equal(panel.json.config.subcommands[1].commands[0].on, false);
 
-    // A tool can come back after a round trip: the old effect must really be
-    // gone, or re-registering the name would fail as a duplicate.
-    const again = await request(config, { method: "POST", body: JSON.stringify({ tools: { memo_status: true } }) });
-    assert.equal(again.status, 200);
-    assert.equal(offered().length, 7);
-    assert.ok(offered().includes("memo_status"));
+    // A patch naming a command this host does not have is refused whole, so a
+    // typo cannot look like a switch that simply did nothing.
+    const typo = await request(config, { method: "POST", body: JSON.stringify({ subcommands: { scan: true, nope: false } }) });
+    assert.equal(typo.status, 400);
+    assert.match(typo.json.error, /unknown command/);
 
     // And the whole thing is owned by this plugin's fiber: stopping it takes
     // every registration with it, which is what makes a reload safe.

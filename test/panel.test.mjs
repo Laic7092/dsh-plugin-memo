@@ -19,8 +19,8 @@ function project() {
   return root;
 }
 
-/** The tool catalogue as a flat list of names — what the card renders in rows. */
-const switchNames = (config) => config.tools.flatMap((group) => group.tools.map((entry) => entry.name));
+/** The command catalogue as a flat list of names — what the card renders in rows. */
+const switchNames = (config) => config.subcommands.flatMap((group) => group.commands.map((entry) => entry.name));
 
 /** The per-file token counts as they landed in the project's index.json. */
 function indexedTokens(root) {
@@ -28,8 +28,8 @@ function indexedTokens(root) {
   return index.files["src/a.ts"].tokens;
 }
 
-/** Everything in `config` except the grouped tool catalogue. */
-const readSwitches = (config) => ({ ...config, tools: undefined });
+/** Everything in `config` except the grouped command catalogue. */
+const readSwitches = (config) => ({ ...config, subcommands: undefined });
 
 /** Bring that project to the state the tools leave it in. */
 function seed(root) {
@@ -60,21 +60,21 @@ test("panelState reports an initialized project", async () => {
     assert.equal(state.initialized, true);
     // The switches travel with the state, because the panel renders them from
     // this one response. A missing `config` took the whole view down once.
-    assert.deepEqual(readSwitches(state.config), { readGuard: false, refresh: false, tokenizer: "estimated", exclude: [], readTools: [], tools: undefined }, "config is present and echoes what the host was handed");
-    // A state object that never heard of per-tool switches reports every tool
-    // on, which is what the host actually did with it.
-    assert.deepEqual(state.config.tools.map((group) => group.id), ["memory", "index", "bugs"]);
+    assert.deepEqual(readSwitches(state.config), { readGuard: false, refresh: false, tokenizer: "estimated", exclude: [], readTools: [], subcommands: undefined }, "config is present and echoes what the host was handed");
+    // A state object that never heard of per-command switches reports every
+    // command on, which is what the host actually did with it.
+    assert.deepEqual(state.config.subcommands.map((group) => group.id), ["memory", "index", "bugs"]);
     assert.deepEqual(switchNames(state.config), [
-      "memo_status",
-      "memo_handoff",
-      "memo_note",
-      "memo_scan",
-      "memo_find",
-      "memo_map",
-      "memo_bug_search",
-      "memo_bug_log",
+      "status",
+      "handoff",
+      "note",
+      "scan",
+      "find",
+      "map",
+      "bug-search",
+      "bug-log",
     ]);
-    assert.ok(state.config.tools.every((group) => group.tools.every((entry) => entry.on === true)));
+    assert.ok(state.config.subcommands.every((group) => group.commands.every((entry) => entry.on === true)));
 
     assert.equal(state.status.present, true);
     assert.deepEqual(state.status.sections.map((section) => section.title), ["现在在哪", "下一步", "未决问题", "不要重犯"]);
@@ -109,16 +109,16 @@ test("the panel reports the switches it was handed, not its own defaults", async
   const root = project();
   try {
     seed(root);
-    const state = await panelState(root, { readGuard: true, refresh: true, exclude: ["addons"], readTools: ["read", "view"], tools: { memo_scan: false } }, null);
-    assert.deepEqual(readSwitches(state.config), { readGuard: true, refresh: true, tokenizer: "estimated", exclude: ["addons"], readTools: ["read", "view"], tools: undefined });
+    const state = await panelState(root, { readGuard: true, refresh: true, exclude: ["addons"], readTools: ["read", "view"], subcommands: { scan: false } }, null);
+    assert.deepEqual(readSwitches(state.config), { readGuard: true, refresh: true, tokenizer: "estimated", exclude: ["addons"], readTools: ["read", "view"], subcommands: undefined });
     // The host's live values, not a copy that could drift from them.
     assert.notEqual(state.config.exclude, undefined);
-    // One tool switched off, and only that one: the panel is reporting state,
-    // not re-deriving "everything is on by default".
-    assert.deepEqual(state.config.tools.find((group) => group.id === "index").tools, [
-      { name: "memo_scan", on: false },
-      { name: "memo_find", on: true },
-      { name: "memo_map", on: true },
+    // One command switched off, and only that one: the panel is reporting
+    // state, not re-deriving "everything is on by default".
+    assert.deepEqual(state.config.subcommands.find((group) => group.id === "index").commands, [
+      { name: "scan", on: false },
+      { name: "find", on: true },
+      { name: "map", on: true },
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -212,7 +212,7 @@ test("panelScan refuses a directory that has no .memo/ yet", async () => {
     const refused = await panelScan(root, {}, null);
     assert.equal(refused.ok, false);
     assert.equal(refused.root, root);
-    assert.match(refused.error, /run memo_scan once in this project first/);
+    assert.match(refused.error, /run memo scan once in this project first/);
     // The refusal is the point: a settings page must not be able to initialize
     // a project's memory in a directory it was merely pointed at.
     assert.equal(existsSync(join(root, ".memo")), false);
@@ -237,7 +237,7 @@ test("panelScan writes an index, and refresh picks up a file nobody announced", 
     const stale = await panelState(root, {}, null);
     assert.equal(stale.index.fileCount, 1);
 
-    // ...and with it, the panel revalidates the way memo_find does.
+    // ...and with it, the panel revalidates the way `memo find` does.
     const fresh = await panelState(root, { refresh: true }, null);
     assert.equal(fresh.index.fileCount, 2);
     assert.equal(fresh.index.staleChanged, 0);

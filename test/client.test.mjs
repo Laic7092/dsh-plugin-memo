@@ -134,7 +134,7 @@ test("the client half loads under the harness module loader and injects its styl
   assert.equal(typeof exported.apply, "function");
   assert.equal(typeof exported.MemoView, "function");
   assert.equal(typeof exported.configCardFor, "function");
-  assert.equal(typeof exported.switchCards.toolsCard, "function");
+  assert.equal(typeof exported.switchCards.commandsCard, "function");
   assert.equal(typeof exported.cards.indexCard, "function");
 
   assert.equal(styles.length, 1, "one self-contained style tag");
@@ -201,9 +201,9 @@ test("a session with no directory yet falls back rather than inventing one", () 
 
 /** The catalogue the host sends, in the grouped shape the card renders. */
 const CATALOGUE = [
-  { id: "memory", tools: [{ name: "memo_status", on: true }, { name: "memo_handoff", on: true }, { name: "memo_note", on: false }] },
-  { id: "index", tools: [{ name: "memo_scan", on: true }, { name: "memo_find", on: true }, { name: "memo_map", on: true }] },
-  { id: "bugs", tools: [{ name: "memo_bug_search", on: true }, { name: "memo_bug_log", on: true }] },
+  { id: "memory", commands: [{ name: "status", on: true }, { name: "handoff", on: true }, { name: "note", on: false }] },
+  { id: "index", commands: [{ name: "scan", on: true }, { name: "find", on: true }, { name: "map", on: true }] },
+  { id: "bugs", commands: [{ name: "bug-search", on: true }, { name: "bug-log", on: true }] },
 ];
 
 /** The checkbox of the switch row whose text contains `label`. */
@@ -253,53 +253,53 @@ test("the read switches report the host's live configuration", () => {
   assert.deepEqual(seen[1], { tokenizer: "exact" }, "the exact counter is asked for by name");
 });
 
-test("the tool switches are grouped by domain and wired to the host", () => {
+test("the subcommand switches are grouped by domain and wired to the host", () => {
   const { exported } = loadClient();
   const seen = [];
-  const tree = exported.switchCards.toolsCard({ tools: CATALOGUE }, false, (patch) => seen.push(patch));
+  const tree = exported.switchCards.commandsCard({ subcommands: CATALOGUE }, false, (patch) => seen.push(patch));
   const text = textOf(tree).join(" ");
 
-  // Every tool gets a row a person can read, not just its registered name.
+  // Every command gets a row a person can read, not just its CLI name.
   for (const label of ["读状态", "写交接", "记一行", "建索引", "找符号", "看地图", "查缺陷", "记缺陷"]) {
     assert.ok(text.includes(label), `the card must carry ${label}`);
   }
   // Grouped the way the host grouped them, each group counting itself.
   for (const group of ["项目记忆", "代码索引", "缺陷记忆"]) assert.ok(text.includes(group), `the card must carry ${group}`);
-  assert.match(text, /工具开关（7\/8 开启）/);
+  assert.match(text, /子命令开关（7\/8 开启）/);
 
   const boxes = elementsOf(tree).filter((node) => node.props && node.props.type === "checkbox");
-  assert.equal(boxes.length, 8, "one switch per tool the host reported");
+  assert.equal(boxes.length, 8, "one switch per command the host reported");
 
-  // One tool, one key — and the row reflects the host, not the default.
+  // One command, one key — and the row reflects the host, not the default.
   const note = boxFor(tree, "记一行");
-  assert.equal(note.props.checked, false, "a tool the host switched off reads as off");
+  assert.equal(note.props.checked, false, "a command the host switched off reads as off");
   note.props.onChange({ target: { checked: true } });
-  assert.deepEqual(seen, [{ tools: { memo_note: true } }]);
+  assert.deepEqual(seen, [{ subcommands: { note: true } }]);
   boxFor(tree, "查缺陷").props.onChange({ target: { checked: false } });
-  assert.deepEqual(seen[1], { tools: { memo_bug_search: false } });
+  assert.deepEqual(seen[1], { subcommands: { "bug-search": false } });
 
   // A group writes its whole set at once, in whichever direction it is not in.
   // The memory group is mixed (2/3), so it offers to finish the job.
   buttonFor(tree, "全开").props.onClick();
-  assert.deepEqual(seen[2], { tools: { memo_status: true, memo_handoff: true, memo_note: true } });
+  assert.deepEqual(seen[2], { subcommands: { status: true, handoff: true, note: true } });
   buttonFor(tree, "全关").props.onClick();
-  assert.deepEqual(seen[3], { tools: { memo_scan: false, memo_find: false, memo_map: false } });
+  assert.deepEqual(seen[3], { subcommands: { scan: false, find: false, map: false } });
 
   // A host that reports no catalogue at all says so instead of rendering an
-  // empty card, and one that reports an unknown tool still shows a usable row.
-  assert.match(textOf(exported.switchCards.toolsCard({}, false, () => {})).join(" "), /没有报告工具清单/);
-  const unknown = textOf(exported.switchCards.toolsCard({ tools: [{ id: "future", tools: [{ name: "memo_from_the_future", on: true }] }] }, false, () => {})).join(" ");
+  // empty card, and one that reports an unknown command still shows a usable row.
+  assert.match(textOf(exported.switchCards.commandsCard({}, false, () => {})).join(" "), /没有报告命令清单/);
+  const unknown = textOf(exported.switchCards.commandsCard({ subcommands: [{ id: "future", commands: [{ name: "from_the_future", on: true }] }] }, false, () => {})).join(" ");
   assert.match(unknown, /future/, "an unknown group keeps its own name");
-  assert.match(unknown, /memo_from_the_future/, "an unknown tool is shown by its name");
+  assert.match(unknown, /from_the_future/, "an unknown command is shown by its name");
 });
 
 test("the two switch cards come back together, in order", () => {
   const { exported } = loadClient();
-  const cards = exported.configCardFor({ readGuard: true, refresh: true, tokenizer: "exact", exclude: [], readTools: ["read"], tools: CATALOGUE }, false, () => {});
+  const cards = exported.configCardFor({ readGuard: true, refresh: true, tokenizer: "exact", exclude: [], readTools: ["read"], subcommands: CATALOGUE }, false, () => {});
   assert.deepEqual(
     cards.map((card) => textOf(card.children[0]).join("")),
-    ["工具开关（7/8 开启）", "读取与刷新（拦截开 · 复核开 · token 精确）"],
-    "the tools first, then the host's read switches",
+    ["子命令开关（7/8 开启）", "读取与刷新（拦截开 · 复核开 · token 精确）"],
+    "the subcommands first, then the host's read switches",
   );
 });
 
@@ -331,16 +331,16 @@ test("a remembered switch is stored as a patch, and replayed only against a host
 
   withWindow(fake, () => {
     // What the card remembers after a save is the host's answer in the host's
-    // own shape — `tools` grouped. Storing that and posting it straight back is
-    // a 400, so the write flattens it into the patch the route accepts.
+    // own shape — `subcommands` grouped. Storing that and posting it straight
+    // back is a 400, so the write flattens it into the patch the route accepts.
     const hostShape = {
       readGuard: true,
       refresh: false,
       exclude: ["addons"],
       readTools: ["read"],
-      tools: [
-        { id: "memory", tools: [{ name: "memo_status", on: false }, { name: "memo_handoff", on: true }, { name: "memo_note", on: true }] },
-        { id: "index", tools: [{ name: "memo_scan", on: true }] },
+      subcommands: [
+        { id: "memory", commands: [{ name: "status", on: false }, { name: "handoff", on: true }, { name: "note", on: true }] },
+        { id: "index", commands: [{ name: "scan", on: true }] },
       ],
     };
     writeStoredConfig(hostShape);
@@ -349,15 +349,15 @@ test("a remembered switch is stored as a patch, and replayed only against a host
       readGuard: true,
       refresh: false,
       exclude: ["addons"],
-      tools: { memo_status: false, memo_handoff: true, memo_note: true, memo_scan: true },
+      subcommands: { status: false, handoff: true, note: true, scan: true },
     });
 
     // A host that already agrees is left alone: no request, so opening the view
     // does not flip anything.
     assert.equal(sameConfig(patchFor(wanted, hostShape), hostShape), true, "nothing to re-apply");
-    assert.deepEqual(patchFor(wanted, hostShape).tools, { memo_status: false, memo_handoff: true, memo_note: true, memo_scan: true });
+    assert.deepEqual(patchFor(wanted, hostShape).subcommands, { status: false, handoff: true, note: true, scan: true });
 
-    // One that disagrees gets the disagreement, and a tool it does not report
+    // One that disagrees gets the disagreement, and a command it does not report
     // is left out rather than sent — one unknown key fails the whole request and
     // would silently cost every switch the person had set.
     const stale = {
@@ -365,16 +365,16 @@ test("a remembered switch is stored as a patch, and replayed only against a host
       refresh: false,
       exclude: ["addons"],
       readTools: ["read"],
-      tools: [{ id: "memory", tools: [{ name: "memo_status", on: true }, { name: "memo_handoff", on: true }, { name: "memo_note", on: true }] }],
+      subcommands: [{ id: "memory", commands: [{ name: "status", on: true }, { name: "handoff", on: true }, { name: "note", on: true }] }],
     };
     const patch = patchFor(wanted, stale);
-    assert.deepEqual(Object.keys(patch.tools), ["memo_status", "memo_handoff", "memo_note"], "memo_scan is not on this host, so it is not replayed");
+    assert.deepEqual(Object.keys(patch.subcommands), ["status", "handoff", "note"], "scan is not on this host, so it is not replayed");
     assert.equal(patch.readGuard, true);
     assert.equal(sameConfig(patch, stale), false, "a host that disagrees re-applies");
     assert.equal(sameConfig(patch, hostShape), true, "…and one that agrees does not");
 
     // Nothing recognisable is nothing to send, not a body full of guesses.
-    writeStoredConfig({ tools: [{ id: "future", tools: [{ name: "memo_from_the_future", on: false }] }] });
+    writeStoredConfig({ subcommands: [{ id: "future", commands: [{ name: "from_the_future", on: false }] }] });
     assert.deepEqual(patchFor(readStoredConfig(), hostShape), {});
     // A host that cannot be understood is never "already in agreement".
     assert.equal(sameConfig({ readGuard: true }, {}), false);
@@ -385,7 +385,7 @@ test("a remembered switch is stored as a patch, and replayed only against a host
     assert.deepEqual(readStoredConfig(), {});
     fake.localStorage.setItem("dsh-plugin-memo:config", "[1,2]");
     assert.deepEqual(readStoredConfig(), {});
-    fake.localStorage.setItem("dsh-plugin-memo:config", '{"readGuard":"yes","refresh":null,"exclude":"a","tools":3}');
+    fake.localStorage.setItem("dsh-plugin-memo:config", '{"readGuard":"yes","refresh":null,"exclude":"a","subcommands":3}');
     assert.deepEqual(readStoredConfig(), {}, "only the keys with the right type survive");
   });
 });
@@ -418,7 +418,7 @@ test("no element styles itself inline", () => {
   const { exported } = loadClient();
   const props = { useSessions: (select) => select({ current: "s-1", byId: { "s-1": { cwd: "/tmp" } } }) };
   const inline = (tree) => elementsOf(tree).filter((node) => node.props && node.props.style !== undefined);
-  const cards = exported.configCardFor({ readGuard: true, refresh: true, exclude: [], readTools: ["read"], tools: CATALOGUE }, false, () => {});
+  const cards = exported.configCardFor({ readGuard: true, refresh: true, exclude: [], readTools: ["read"], subcommands: CATALOGUE }, false, () => {});
 
   // An inline style cannot follow the theme, and cannot answer to the width the
   // view is given — so the layout has to live in the stylesheet, every time.

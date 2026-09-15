@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
+import { MEMO_COMMAND_NAMES } from "../lib/cli.js";
 import { countTokens } from "../lib/tokenizer.js";
 import { join } from "node:path";
 
@@ -154,14 +155,14 @@ function scratchProject() {
 
 const agentIn = (cwd) => ({ signal: new AbortController().signal, agent: { session: { header: { cwd }, id: "session-test" } } });
 
-/** The tool catalogue as a flat list of names — one row per switch on screen. */
-const switchNames = (config) => config.tools.flatMap((group) => group.tools.map((entry) => entry.name));
+/** The command catalogue as a flat list of names — one row per switch on screen. */
+const switchNames = (config) => config.subcommands.flatMap((group) => group.commands.map((entry) => entry.name));
 
-/** The tool catalogue as `{ name: on }`. */
-const switchState = (config) => Object.fromEntries(config.tools.flatMap((group) => group.tools.map((entry) => [entry.name, entry.on])));
+/** The command catalogue as `{ name: on }`. */
+const switchState = (config) => Object.fromEntries(config.subcommands.flatMap((group) => group.commands.map((entry) => [entry.name, entry.on])));
 
-/** Everything in `config` except the grouped tool catalogue. */
-const readSwitches = (config) => ({ ...config, tools: undefined });
+/** Everything in `config` except the grouped command catalogue. */
+const readSwitches = (config) => ({ ...config, subcommands: undefined });
 
 test("the state route revalidates in the counter it is asked for", { skip }, async () => {
   const base = scratchProject();
@@ -235,20 +236,22 @@ test("the settings route round-trips the token counter and refuses a name it doe
   }
 });
 
-test("host half registers eight tools and one human command", { skip }, () => {
+test("host half registers one tool and one human command", { skip }, () => {
   assert.equal(host.name, "dsh-plugin-memo");
   assert.deepEqual(host.inject, ["tools"]);
 
   const fake = fakeContext();
   host.apply(fake.ctx, {});
-  assert.deepEqual(
-    [...fake.tools.keys()],
-    ["memo_status", "memo_handoff", "memo_note", "memo_bug_search", "memo_bug_log", "memo_scan", "memo_find", "memo_map"],
-  );
-  for (const tool of fake.tools.values()) {
-    assert.ok(tool.description.length > 20);
-    assert.equal(typeof tool.execute, "function");
-  }
+  // One tool for the whole grammar: that is the standing context cost, and it
+  // is one description plus one string parameter rather than one schema per
+  // operation.
+  assert.deepEqual([...fake.tools.keys()], ["memo"]);
+  const tool = fake.tools.get("memo");
+  assert.ok(tool.description.length > 20);
+  assert.equal(typeof tool.execute, "function");
+  assert.deepEqual(Object.keys(tool.parameters.properties), ["command"]);
+  assert.equal(tool.parameters.required, undefined, "the command line is optional: omitting it is \`status\`");
+  assert.match(tool.description, /memo status/);
   assert.equal(fake.commands.length, 1);
   assert.equal(fake.commands[0].name, "memo");
   assert.equal(fake.commands[0].definitionId, "dsh-plugin-memo");
@@ -293,7 +296,7 @@ test("the repeated-read guard refuses a second read of an unchanged window", { s
 test("the guard can be turned off, and then no listener is installed", { skip }, () => {
   const fake = fakeContext();
   host.apply(fake.ctx, { readGuard: false });
-  assert.equal(fake.tools.size, 8);
+  assert.equal(fake.tools.size, 1, "the tool does not depend on the guard");
   assert.equal(fake.handlerCount(), 0, "no read guard handler when it is disabled");
 });
 
@@ -308,13 +311,12 @@ test("the switches change the host at runtime, and the guard really comes back",
     assert.ok(config !== undefined, "the config route is registered");
 
     assert.equal(fake.handlerCount(), 0, "off means no listener at all");
-    const read = fake.tools.get("memo_status");
-    assert.ok(read !== undefined);
+    assert.ok(fake.tools.get("memo") !== undefined);
 
     // What the panel is told is the host's live state, not its own wish.
     const initial = await request(config);
     assert.equal(initial.status, 200);
-    assert.deepEqual(readSwitches(initial.json.config), { readGuard: false, refresh: true, tokenizer: "estimated", exclude: ["generated"], readTools: ["read"], tools: undefined });
+    assert.deepEqual(readSwitches(initial.json.config), { readGuard: false, refresh: true, tokenizer: "estimated", exclude: ["generated"], readTools: ["read"], subcommands: undefined });
 
     // Flip it on: the listeners appear, and the guard actually refuses.
     const on = await request(config, { method: "POST", body: JSON.stringify({ readGuard: true }) });
@@ -351,63 +353,64 @@ test("the switches change the host at runtime, and the guard really comes back",
   }
 });
 
-test("a tool switch takes the tool out of the registry, and puts it back", { skip }, async () => {
+test("a command switch is enforced at the CLI, and lifted again", { skip }, async () => {
   const base = scratchProject();
   try {
     writeFileSync(join(base, "a.ts"), "export function alpha() {}\n", "utf8");
     const fake = fakeContext();
-    // One tool pinned off by the composition, the rest on.
-    host.apply(fake.ctx, { tools: { memo_status: false } });
-    assert.equal(fake.tools.size, 7, "a pinned-off tool is never registered at all");
-    assert.equal(fake.tools.has("memo_status"), false);
+    // One command pinned off by the composition, the rest on.
+    host.apply(fake.ctx, { subcommands: { scan: false } });
+    assert.equal(fake.tools.size, 1, "there is one tool whatever the switches say");
 
+    const exec = agentIn(base);
+    const memo = (command) => fake.tools.get("memo").execute({ command }, exec);
     const config = fake.routes.find((route) => route.path === "/memo/config");
     const panel = fake.routes.find((route) => route.path === "/memo/state");
     const initial = await request(config);
-    assert.deepEqual(initial.json.config.tools.find((group) => group.id === "memory").tools, [
-      { name: "memo_status", on: false },
-      { name: "memo_handoff", on: true },
-      { name: "memo_note", on: true },
+    assert.deepEqual(initial.json.config.subcommands.find((group) => group.id === "index").commands, [
+      { name: "scan", on: false },
+      { name: "find", on: true },
+      { name: "map", on: true },
     ]);
+    // Off means the host refuses the command, for the model and for /memo
+    // alike — a switch that only hid a row would be a lie about what runs.
+    assert.match(await memo("scan"), /被关掉了/);
 
-    // On: the tool is back, and it is the same tool — not a stub that refuses.
-    const on = await request(config, { method: "POST", body: JSON.stringify({ tools: { memo_status: true } }) });
+    // On: the same call does the real work, not a stub that pretends.
+    const on = await request(config, { method: "POST", body: JSON.stringify({ subcommands: { scan: true } }) });
     assert.equal(on.status, 200);
-    assert.equal(fake.tools.size, 8);
-    assert.match(await fake.tools.get("memo_status").execute({}, agentIn(base)), /还没有 \.memo\/STATUS\.md/);
+    assert.match(await memo("scan"), /已重建索引/);
 
-    // Off again: it leaves the registry, so the model cannot see or call it.
-    const off = await request(config, { method: "POST", body: JSON.stringify({ tools: { memo_status: false } }) });
-    assert.equal(off.json.config.tools[0].tools[0].on, false);
-    assert.equal(fake.tools.has("memo_status"), false);
-    assert.equal(fake.tools.size, 7, "and no registration is left stacked behind it");
+    // Off again, and the reason is in the answer rather than in a failed call.
+    const off = await request(config, { method: "POST", body: JSON.stringify({ subcommands: { scan: false } }) });
+    assert.equal(off.json.config.subcommands[1].commands[0].on, false);
+    assert.match(await memo("scan"), /被关掉了/);
 
     // The panel's state route reports the same live set. It used to be handed a
     // hand-built snapshot of the plugin state, which is how a whole field went
     // missing from the payload once.
     const live = await request(panel, { url: `/memo/state?root=${encodeURIComponent(base)}` });
-    assert.equal(switchState(live.json.config).memo_status, false);
-    await request(config, { method: "POST", body: JSON.stringify({ tools: { memo_scan: false, memo_bug_log: false } }) });
-    assert.equal(fake.tools.size, 5, "one patch can carry several tools");
-    assert.equal((await request(panel, { url: `/memo/state?root=${encodeURIComponent(base)}` })).json.config.tools.find((group) => group.id === "bugs").tools[1].on, false);
+    assert.equal(switchState(live.json.config).scan, false);
+    await request(config, { method: "POST", body: JSON.stringify({ subcommands: { find: false, "bug-log": false } }) });
+    assert.equal((await request(panel, { url: `/memo/state?root=${encodeURIComponent(base)}` })).json.config.subcommands.find((group) => group.id === "bugs").commands[1].on, false);
 
     // A patch is validated as a whole before any of it lands: a typo must not
     // look like a switch that simply did nothing.
-    for (const body of ['{"tools":{"memo_map":false,"memo_nope":false}}', '{"tools":{"memo_map":"no"}}', '{"tools":["memo_map"]}']) {
+    for (const body of ['{"subcommands":{"map":false,"nope":false}}', '{"subcommands":{"map":"no"}}', '{"subcommands":["map"]}']) {
       const refused = await request(config, { method: "POST", body });
       assert.equal(refused.status, 400, `${body} is refused`);
-      assert.equal(fake.tools.has("memo_map"), true, "the valid half of a refused patch is not applied either");
+      assert.equal(switchState((await request(config)).json.config).map, true, "the valid half of a refused patch is not applied either");
     }
-    assert.match((await request(config, { method: "POST", body: '{"tools":{"memo_nope":false}}' })).json.error, /unknown tool/);
+    assert.match((await request(config, { method: "POST", body: '{"subcommands":{"nope":false}}' })).json.error, /unknown command/);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
 
-test("every tool still registers when no command registry exists", { skip }, () => {
+test("the tool still registers when no command registry exists", { skip }, () => {
   const fake = fakeContext({ commands: false });
   host.apply(fake.ctx, {});
-  assert.equal(fake.tools.size, 8);
+  assert.equal(fake.tools.size, 1);
   assert.equal(fake.commands.length, 0);
   assert.equal(fake.injectCalls(), 2, "both optional scopes are still attempted; neither activates without its service");
 });
@@ -418,16 +421,16 @@ test("handoff writes STATUS.md and status reads it back", { skip }, async () => 
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const exec = agentIn(base);
-    const run = (name, args) => fake.tools.get(name).execute(args, exec);
+    const run = (command) => fake.tools.get("memo").execute({ command }, exec);
 
     // Before anything is written the project honestly reports nothing.
-    assert.match(await run("memo_status", {}), /还没有 \.memo\/STATUS\.md/);
+    assert.match(await run("status"), /还没有 \.memo\/STATUS\.md/);
 
-    const written = await run("memo_handoff", { now: "在把登录换成 token 校验", next: "- 补过期路径的测试", avoid: "别再动 session 中间件" });
+    const written = await run('handoff --now "在把登录换成 token 校验" --next "- 补过期路径的测试" --avoid "别再动 session 中间件"');
     assert.match(written, /已更新/);
     assert.match(written, /在把登录换成 token 校验/);
 
-    const status = await run("memo_status", {});
+    const status = await run("status");
     assert.match(status, /在把登录换成 token 校验/);
     assert.match(status, /补过期路径的测试/);
     assert.match(status, /别再动 session 中间件/);
@@ -447,11 +450,11 @@ test("a second handoff updates only what it passes", { skip }, async () => {
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const exec = agentIn(base);
-    const run = (name, args) => fake.tools.get(name).execute(args, exec);
+    const run = (command) => fake.tools.get("memo").execute({ command }, exec);
 
-    await run("memo_handoff", { now: "第一阶段", next: "往下做 B" });
-    await run("memo_handoff", { now: "第二阶段" });
-    const status = await run("memo_status", {});
+    await run('handoff --now "第一阶段" --next "往下做 B"');
+    await run('handoff --now "第二阶段"');
+    const status = await run("status");
     assert.match(status, /第二阶段/);
     assert.match(status, /往下做 B/, "the untouched section survives");
     assert.doesNotMatch(status, /第一阶段/);
@@ -466,53 +469,80 @@ test("the journal and the bug log round-trip", { skip }, async () => {
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const exec = agentIn(base);
-    const run = (name, args) => fake.tools.get(name).execute(args, exec);
+    const run = (command) => fake.tools.get("memo").execute({ command }, exec);
 
-    assert.match(await run("memo_note", { text: "改用 zod 解析配置" }), /已记录/);
-    assert.match(await run("memo_note", { text: "决定不上 redis", kind: "decision" }), /\[decision\]/);
-    assert.match(await run("memo_note", { text: "   " }), /不能为空/);
+    assert.match(await run("note 改用 zod 解析配置"), /已记录/);
+    assert.match(await run("note 决定不上 redis --kind decision"), /\[decision\]/);
+    assert.match(await run("note"), /需要一句话/);
 
-    const status = await run("memo_status", {});
+    const status = await run("status");
     assert.match(status, /决定不上 redis/);
     assert.match(status, /最近动作（2\/2 条）/);
 
-    assert.match(await run("memo_bug_search", { term: "boom" }), /还没有 bug 记忆/);
+    assert.match(await run("bug-search boom"), /还没有 bug 记忆/);
 
-    const logged = await run("memo_bug_log", { error_message: "EADDRINUSE: port 3000", root_cause: "旧进程没退", fix: "先 kill" });
+    const logged = await run('bug-log --error "EADDRINUSE: port 3000" --cause "旧进程没退" --fix "先 kill"');
     assert.match(logged, /bug-001/);
-    const again = await run("memo_bug_log", { error_message: " eaddrinuse:  PORT 3000 " });
+    const again = await run('bug-log --error " eaddrinuse:  PORT 3000 "');
     assert.match(again, /同一症状第 2 次/);
 
-    const found = await run("memo_bug_search", { term: "EADDRINUSE" });
+    const found = await run("bug-search EADDRINUSE");
     assert.match(found, /bug-001/);
     assert.match(found, /先 kill/);
-    assert.match(await run("memo_bug_search", { term: "完全无关的东西" }), /没有匹配/);
+    assert.match(await run("bug-search 完全无关的东西"), /没有匹配/);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
 
-test("/memo answers without spending a model turn", { skip }, async () => {
+test("/memo runs the same grammar as the tool, without spending a model turn", { skip }, async () => {
   const base = scratchProject();
   try {
+    writeFileSync(join(base, "a.ts"), "export function alpha() {}\n", "utf8");
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const definition = fake.commands[0];
     const invocation = (rawInput) => ({ rawInput, agent: { session: { header: { cwd: base }, id: "session-test" } }, signal: new AbortController().signal });
 
+    // Bare /memo is the status, which is what a person types most.
     const empty = await definition.handler(invocation(""));
     assert.equal(empty.kind, "success");
     assert.match(empty.text, /还没有 \.memo\/STATUS\.md/);
 
-    const noted = await definition.handler(invocation("note 从这里开始"));
+    // The write side a person can now reach directly, and the kind flag with it.
+    const noted = await definition.handler(invocation("note 从这里开始 --kind decision"));
     assert.equal(noted.kind, "success");
+    assert.match(noted.text, /\[decision\]/);
+
+    const handed = await definition.handler(invocation('handoff --now "在写 /memo"'));
+    assert.equal(handed.kind, "success");
+    assert.match(handed.text, /已更新/);
+
+    const scanned = await definition.handler(invocation("scan"));
+    assert.equal(scanned.kind, "success");
+    assert.match(scanned.text, /已重建索引/);
+
+    const found = await definition.handler(invocation("find alpha"));
+    assert.equal(found.kind, "success");
+    assert.match(found.text, /a\.ts/);
 
     const shown = await definition.handler(invocation(""));
     assert.match(shown.text, /从这里开始/);
     assert.match(shown.text, /最近动作/);
+    assert.match(shown.text, /在写 \/memo/);
 
+    // A refusal is an error result carrying the reason, not a silent success.
     const bad = await definition.handler(invocation("note"));
-    assert.equal(bad.kind, "success", "`/memo note` without text is a status request, not a crash");
+    assert.equal(bad.kind, "error");
+    assert.match(bad.text, /需要一句话/);
+
+    const unknown = await definition.handler(invocation("frobnicate"));
+    assert.equal(unknown.kind, "error");
+    assert.match(unknown.text, /不认识的子命令/);
+
+    const help = await definition.handler(invocation("help"));
+    assert.equal(help.kind, "success");
+    assert.match(help.text, /memo scan/);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -525,30 +555,31 @@ test("an explicit root overrides the session directory", { skip }, async () => {
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const exec = agentIn(sessionDir);
-    await fake.tools.get("memo_handoff").execute({ root: target, now: "在 target 项目里" }, exec);
-    assert.match(await fake.tools.get("memo_status").execute({ root: target }, exec), /在 target 项目里/);
-    assert.match(await fake.tools.get("memo_status").execute({}, exec), /还没有 \.memo\/STATUS\.md/);
+    const memo = (command) => fake.tools.get("memo").execute({ command }, exec);
+    await memo(`handoff --root ${target} --now "在 target 项目里"`);
+    assert.match(await memo(`status --root ${target}`), /在 target 项目里/);
+    assert.match(await memo("status"), /还没有 \.memo\/STATUS\.md/);
   } finally {
     rmSync(sessionDir, { recursive: true, force: true });
     rmSync(target, { recursive: true, force: true });
   }
 });
 
-test("memo_find revalidates the index instead of trusting a stale one", { skip }, async () => {
+test("`memo find` revalidates the index instead of trusting a stale one", { skip }, async () => {
   const base = scratchProject();
   try {
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const exec = agentIn(base);
-    const run = (name, args) => fake.tools.get(name).execute(args, exec);
+    const run = (command) => fake.tools.get("memo").execute({ command }, exec);
 
     writeFileSync(join(base, "a.ts"), "export function alpha() {}\n", "utf8");
-    await run("memo_scan", {});
+    await run("scan");
 
     // A file the scan never saw, written by something that announced nothing —
     // exactly what a hook keyed on this process's own writes would miss.
     writeFileSync(join(base, "b.ts"), "export function beta() {}\n", "utf8");
-    const found = await run("memo_find", { query: "beta" });
+    const found = await run("find beta");
     assert.match(found, /b\.ts/);
     assert.match(found, /索引已自动同步：\+1 新文件/);
 
@@ -556,23 +587,23 @@ test("memo_find revalidates the index instead of trusting a stale one", { skip }
     const later = new Date(Date.now() + 5000);
     writeFileSync(join(base, "a.ts"), "export function renamed() {}\n", "utf8");
     utimesSync(join(base, "a.ts"), later, later);
-    const edited = await run("memo_find", { query: "renamed" });
+    const edited = await run("find renamed");
     assert.match(edited, /a\.ts/);
     assert.match(edited, /索引已自动同步：~1 改写/);
 
     // Nothing moved: the answer is silent about syncing.
-    assert.doesNotMatch(await run("memo_find", { query: "renamed" }), /索引已自动同步/);
-    assert.doesNotMatch(await run("memo_map", {}), /索引已自动同步/);
+    assert.doesNotMatch(await run("find renamed"), /索引已自动同步/);
+    assert.doesNotMatch(await run("map"), /索引已自动同步/);
 
     // With revalidation turned off the index is exactly what the last scan
     // wrote — and the answer says nothing was synced, rather than implying it was.
     writeFileSync(join(base, "c.ts"), "export function gamma() {}\n", "utf8");
     const pinned = fakeContext();
     host.apply(pinned.ctx, { refresh: false });
-    const stale = await pinned.tools.get("memo_find").execute({ query: "gamma" }, exec);
+    const stale = await pinned.tools.get("memo").execute({ command: "find gamma" }, exec);
     assert.match(stale, /索引里没有匹配/);
     assert.doesNotMatch(stale, /索引已自动同步/);
-    assert.match(await run("memo_find", { query: "gamma" }), /c\.ts/, "the default path does see it");
+    assert.match(await run("find gamma"), /c\.ts/, "the default path does see it");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -602,8 +633,8 @@ test("the settings panel routes answer JSON, and the write route is guarded", { 
     // Build real memory through the tools, then read it back through the route.
     writeFileSync(join(base, "a.ts"), "export function alpha() {}\n", "utf8");
     const exec = agentIn(base);
-    await fake.tools.get("memo_handoff").execute({ now: "面板接线中" }, exec);
-    await fake.tools.get("memo_scan").execute({}, exec);
+    await fake.tools.get("memo").execute({ command: 'handoff --now "面板接线中"' }, exec);
+    await fake.tools.get("memo").execute({ command: "scan" }, exec);
 
     const filled = await request(state, { url: `/memo/state?root=${encodeURIComponent(base)}` });
     assert.equal(filled.status, 200);
@@ -613,11 +644,11 @@ test("the settings panel routes answer JSON, and the write route is guarded", { 
     assert.equal(filled.json.index.fileCount, 1);
     // The switches ride along with the state the panel is already reading. When
     // they did not, the view crashed on the missing field.
-    assert.deepEqual(readSwitches(filled.json.config), { readGuard: true, refresh: true, tokenizer: "estimated", exclude: [], readTools: ["read"], tools: undefined });
-    // The catalogue and the registrations are the same set: a tool with no
-    // switch would be unreachable from the panel, and a switch with no tool
-    // would be a row that lies about what the host has.
-    assert.deepEqual([...switchNames(filled.json.config)].sort(), [...fake.tools.keys()].sort());
+    assert.deepEqual(readSwitches(filled.json.config), { readGuard: true, refresh: true, tokenizer: "estimated", exclude: [], readTools: ["read"], subcommands: undefined });
+    // The catalogue is the CLI's own command list rather than a second copy of
+    // it, and the host has exactly one tool however many commands there are.
+    assert.deepEqual(switchNames(filled.json.config), MEMO_COMMAND_NAMES);
+    assert.deepEqual([...fake.tools.keys()], ["memo"]);
     assert.ok(Object.values(switchState(filled.json.config)).every((on) => on === true));
 
     // A relative root is refused rather than resolved against the host's cwd.
@@ -633,7 +664,7 @@ test("the settings panel routes answer JSON, and the write route is guarded", { 
     // ...and refuses a directory with no .memo/ instead of creating one there.
     const refused = await request(scan, { method: "POST", url: `/memo/scan?root=${encodeURIComponent(other)}` });
     assert.equal(refused.status, 400);
-    assert.match(refused.json.error, /memo_scan once in this project first/);
+    assert.match(refused.json.error, /memo scan once in this project first/);
     assert.equal(existsSync(join(other, ".memo")), false);
 
     // A real scan answers with what it built.
@@ -654,10 +685,10 @@ test("a big index is read whole instead of being cut off mid-JSON", { skip }, as
     const fake = fakeContext();
     host.apply(fake.ctx, {});
     const exec = agentIn(base);
-    const run = (name, args) => fake.tools.get(name).execute(args, exec);
+    const run = (command) => fake.tools.get("memo").execute({ command }, exec);
 
     writeFileSync(join(base, "a.ts"), "export function alpha() {}\n", "utf8");
-    await run("memo_scan", {});
+    await run("scan");
 
     // A real repository's index passes 400 KB without trying; pad this one past
     // the per-file read cap, which is not the cap the index is read under.
@@ -667,10 +698,10 @@ test("a big index is read whole instead of being cut off mid-JSON", { skip }, as
     writeFileSync(indexFile, JSON.stringify(index, null, 2), "utf8");
     assert.ok(readFileSync(indexFile).length > 400_000);
 
-    const found = await run("memo_find", { query: "alpha" });
+    const found = await run("find alpha");
     assert.doesNotMatch(found, /is not valid JSON/);
     assert.match(found, /a\.ts/);
-    assert.doesNotMatch(await run("memo_map", {}), /没有可用的代码索引/);
+    assert.doesNotMatch(await run("map"), /没有可用的代码索引/);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
