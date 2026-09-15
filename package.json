@@ -1,0 +1,43 @@
+{
+  "name": "dsh-plugin-memo",
+  "version": "0.1.0",
+  "description": "Project memory for DeepSeek Harness: a committed .memo/ directory holding STATUS.md, an action journal and a bug log, exposed as model tools, a /memo human command, and a Memo view in the session.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/store.js && node --check lib/status.js && node --check lib/bugs.js && node --check lib/journal.js && node --check lib/indexer.js && node --check lib/reads.js && node --check lib/ts-symbols.js && node --check lib/panel.js && node --check lib/client.js && node --check scripts/build-godot-grammars.mjs",
+    "build:grammars": "node scripts/build-godot-grammars.mjs",
+    "test": "node --test test/store.test.mjs test/indexer.test.mjs test/godot.test.mjs test/guard.test.mjs test/panel.test.mjs test/client.test.mjs test/host.test.mjs test/cordis.test.mjs"
+  },
+  "optionalDependencies": {
+    "web-tree-sitter": "^0.24.7",
+    "tree-sitter-wasms": "^0.1.13"
+  }
+}

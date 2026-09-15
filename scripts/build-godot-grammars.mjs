@@ -1,0 +1,291 @@
+#!/usr/bin/env node
+/**
+ * Build the two grammars this plugin ships, `lib/grammars/tree-sitter-gdscript.wasm`
+ * and `lib/grammars/tree-sitter-godot-resource.wasm`. `tree-sitter-wasms` carries
+ * neither, so both are compiled here from the published grammars.
+ *
+ * Four things make this a script instead of a note in a commit message: the
+ * grammar versions are pinned, each parser's ABI is checked against the
+ * `web-tree-sitter` the plugin depends on, the emscripten image is pinned, and
+ * every build is run through the plugin's own analyzer before it is kept. A
+ * grammar that loads but cannot read its language fails silently, and silently
+ * is the one way the ceiling is worse than the floor.
+ *
+ * Needs `docker` (the emscripten SDK arrives as an image) and `tar`:
+ *
+ *   node scripts/build-godot-grammars.mjs
+ *   node scripts/build-godot-grammars.mjs --registry https://registry.npmmirror.com
+ *
+ * The registry is `$npm_config_registry`, then npmjs.org. A mirror close to
+ * home is usually the difference between two minutes and twenty.
+ */
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** The emscripten both shipped wasms were built with. */
+const EMSDK = "emscripten/emsdk:3.1.64";
+/** `web-tree-sitter` ^0.24 accepts ABI 13 through 14; 15 would not load. */
+const MAX_ABI = 14;
+/**
+ * tree-sitter-godot-resource 0.7.0 lexes only a bare quote as its external
+ * \`string\` token, so Godot 4's two prefixed literals — StringName and
+ * NodePath — fail to lex. One failed token sets \`rootNode.hasError\`, and the
+ * analyzer rejects the whole file for it, which is why every scene carrying a
+ * StringName fell back to the line-based pass. \`grammar.js\` already accepts
+ * \`$.string\` wherever a value may appear, so widening the scanner is the entire
+ * fix: no \`parser.c\` regeneration, and the grammar stays the published one.
+ */
+const SCANNER_PATCH = {
+  file: "src/scanner.c",
+  from: [
+    "    if (lexer->lookahead != '" + String.fromCharCode(34) + "') {",
+    "      return false;",
+    "    }",
+  ].join("\n"),
+  to: [
+    "    // Godot 4 prefixes the quote for two value kinds: a StringName and a",
+    "    // NodePath. The grammar takes both as the same string token, so the",
+    "    // prefix is consumed here and the token starts at it.",
+    "    if (lexer->lookahead == '&' || lexer->lookahead == '^') {",
+    "      lexer->advance(lexer, false);",
+    "    }",
+    "",
+    "    if (lexer->lookahead != '" + String.fromCharCode(34) + "') {",
+    "      return false;",
+    "    }",
+  ].join("\n"),
+};
+
+/** Widen the pinned scanner; refuse to guess if upstream is not the shape we patch. */
+function applyScannerPatch(path) {
+  const before = readFileSync(path, "utf8");
+  if (before.includes(SCANNER_PATCH.to)) return; // already applied
+  if (!before.includes(SCANNER_PATCH.from)) {
+    throw new Error(
+      path + ": the pinned " + SCANNER_PATCH.file + " is not the shape SCANNER_PATCH expects — " +
+        "read it again before patching; the grammar may have been reworked upstream.",
+    );
+  }
+  writeFileSync(path, before.replace(SCANNER_PATCH.from, SCANNER_PATCH.to));
+  console.log("patched " + path + " (StringName / NodePath prefixes)");
+}
+/**
+ * One entry per shipped grammar: the pinned package, a fixture built from the
+ * forms a line-based pass gets wrong, and the symbol table the parse of that
+ * fixture has to produce — asserted through the plugin's own analyzer, so the
+ * extension mapping and the node spec are covered along with the wasm.
+ */
+const GRAMMARS = [
+  {
+    package: "tree-sitter-gdscript",
+    version: "6.1.0",
+    // The grammar's own name: `tree-sitter-wasms` names its files this way, and
+    // it is also the suffix of the `tree_sitter_*` function the loader looks for.
+    name: "gdscript",
+    ext: ".gd",
+    // An indentation body that spans lines, a lambda inside it, and a nested
+    // class whose member is only a member because of where it sits.
+    source: [
+      "class_name Smoke", // 1
+      "extends Node", // 2
+      "", // 3
+      "func _ready() -> void:", // 4
+      "\tvar nested = func(): return 1", // 5
+      "\tif true:", // 6
+      "\t\tpass", // 7
+      "", // 8
+      "class Inner:", // 9
+      "\tfunc leaf() -> void:", // 10
+      "\t\tpass", // 11
+      "", // 12
+    ].join("\n"),
+    expected: [
+      ["Smoke", "class", 1, 1],
+      ["_ready", "function", 4, 7],
+      ["nested", "var", 5, 5],
+      ["Inner", "class", 9, 11],
+      ["Inner.leaf", "method", 10, 11],
+    ],
+  },
+  {
+    package: "tree-sitter-godot-resource",
+    version: "0.7.0",
+    name: "godot_resource",
+    ext: ".tscn",
+    // A node header whose attributes are not in the order the line-based pass
+    // accepts, and a sub-resource whose section runs past its header line.
+    source: [
+      "[gd_scene load_steps=2 format=3]", // 1
+      "", // 2
+      '[ext_resource type="Script" path="res://player.gd" id="1_a"]', // 3
+      "", // 4
+      '[sub_resource type="RectangleShape2D" id="Shape_1"]', // 5
+      "size = Vector2(16, 32)", // 6
+      "", // 7
+      '[node type="CharacterBody2D" name="Player"]', // 8
+      'script = ExtResource("1_a")', // 9
+      "", // 10
+      '[node name="Sprite" type="Sprite2D" parent="."]', // 11
+      "", // 12
+      '[node name="Hitbox" type="Area2D" parent="Player"]', // 13
+      "", // 14
+      // The two prefixed literals the scanner patch exists for: a StringName
+      // and a NodePath, as values of a node section.
+      '[node name="Typed" type="Node" parent="."]', // 15
+      'name_id = &"typed"', // 16
+      'target = ^"Player/Sprite"', // 17
+      "", // 18
+    ].join("\n"),
+    expected: [
+      ["Shape_1", "sub_resource", 5, 6],
+      ["Player", "node", 8, 9],
+      ["Sprite", "node", 11, 11],
+      ["Player/Hitbox", "node", 13, 13],
+      ["Typed", "node", 15, 17],
+    ],
+  },
+];
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, "..");
+const shipped = join(root, "lib", "grammars");
+/**
+ * Built inside the repo rather than in the system temp directory: docker has to
+ * see the same path this script writes to, and /tmp is not always shared with
+ * the daemon. Removed again on the way out, success or failure.
+ */
+const work = join(root, ".build-godot-grammars");
+
+/** Download, check, and compile one grammar; returns the wasm in the work dir. */
+async function compile(entry, registry) {
+  const dir = join(work, entry.package);
+  const tarball =
+    registry.replace(/\/$/, "") + "/" + entry.package + "/-/" + entry.package + "-" + entry.version + ".tgz";
+  console.log("\n== " + entry.package + "@" + entry.version + " ==");
+  console.log("fetching " + tarball);
+  const response = await fetch(tarball);
+  if (!response.ok) throw new Error("GET " + tarball + " -> " + response.status);
+  const archive = join(dir, entry.package + ".tgz");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(archive, Buffer.from(await response.arrayBuffer()));
+  execFileSync("tar", ["xzf", archive, "-C", dir], { stdio: "inherit" });
+
+  const source = join(dir, "package", "src");
+  applyScannerPatch(join(source, "scanner.c"));
+  const parser = readFileSync(join(source, "parser.c"), "utf8");
+  const abi = /#define LANGUAGE_VERSION (\d+)/.exec(parser);
+  if (abi === null) throw new Error(entry.package + ": parser.c declares no LANGUAGE_VERSION");
+  if (Number(abi[1]) > MAX_ABI) {
+    throw new Error(
+      entry.package + " generates ABI " + abi[1] + ", and web-tree-sitter ^0.24 loads at most " + MAX_ABI +
+        " — raise the web-tree-sitter dependency in package.json before building.",
+    );
+  }
+  // The loader finds a grammar by the `tree_sitter_<name>` function it exports,
+  // so the name is not decoration: it is how the wasm announces itself.
+  const language = "tree_sitter_" + entry.name;
+  if (!parser.includes(language + "(")) {
+    throw new Error(entry.package + ": parser.c defines no " + language + "()");
+  }
+
+  const build = join(dir, "build");
+  const out = join(dir, "out");
+  mkdirSync(join(build, "src", "tree_sitter"), { recursive: true });
+  mkdirSync(out, { recursive: true });
+  copyFileSync(join(source, "parser.c"), join(build, "src", "parser.c"));
+  copyFileSync(join(source, "scanner.c"), join(build, "src", "scanner.c"));
+  for (const header of readdirSync(join(source, "tree_sitter"))) {
+    copyFileSync(join(source, "tree_sitter", header), join(build, "src", "tree_sitter", header));
+  }
+
+  // A side module, exactly like the grammars in `tree-sitter-wasms`: it imports
+  // memory, the allocator and its external scanner's GOT entries from the
+  // web-tree-sitter runtime instead of carrying its own. `-Isrc` is what makes
+  // the `<tree_sitter/parser.h>` the resource scanner asks for resolvable.
+  execFileSync("docker", [
+    "run", "--rm",
+    "-v", build + ":/src",
+    "-v", out + ":/out",
+    "-w", "/src",
+    EMSDK,
+    "emcc", "-o", "/out/" + entry.name + ".wasm", "src/parser.c", "src/scanner.c", "-Isrc",
+    "-Os", "-fPIC", "-sWASM=1", "-sSIDE_MODULE=1", "-sERROR_ON_UNDEFINED_SYMBOLS=0",
+  ], { stdio: "inherit" });
+
+  const wasm = join(out, entry.name + ".wasm");
+  entry.output = "tree-sitter-" + entry.name + ".wasm";
+  entry.abi = abi[1];
+  entry.function = language;
+  return wasm;
+}
+
+/** Put every build in place, then read it back through the plugin's analyzer. */
+async function installAndCheck(built) {
+  const previous = new Map();
+  const targets = [];
+  for (const [entry, wasm] of built) {
+    const target = join(shipped, entry.output);
+    previous.set(target, existsSync(target) ? readFileSync(target) : null);
+    copyFileSync(wasm, target);
+    chmodSync(target, 0o644); // a grammar is data, however the container left it
+    targets.push(target);
+  }
+
+  const { createTsAnalyzer } = await import("../lib/ts-symbols.js");
+  const analyzer = await createTsAnalyzer();
+  if (analyzer === null) throw new Error("web-tree-sitter is not installed, so nothing can be checked");
+
+  const wrong = [];
+  for (const entry of GRAMMARS) {
+    const symbols = await analyzer.analyze(entry.source, entry.ext);
+    const actual = symbols === null ? null : symbols.map((s) => [s.name, s.kind, s.line, s.endLine]);
+    if (JSON.stringify(actual) !== JSON.stringify(entry.expected)) {
+      wrong.push(entry.output + "\n    expected " + JSON.stringify(entry.expected) + "\n    parsed   " + JSON.stringify(actual));
+    }
+  }
+  if (wrong.length > 0) {
+    // A build that reads its language wrong is worse than no build at all: put
+    // back what was working before saying anything about the new one.
+    for (const [target, was] of previous) {
+      if (was === null) rmSync(target, { force: true });
+      else writeFileSync(target, was);
+    }
+    throw new Error("the built grammars do not match their fixtures:\n  " + wrong.join("\n  "));
+  }
+  return targets;
+}
+
+async function main() {
+  const flag = process.argv.indexOf("--registry");
+  const registry = flag === -1
+    ? process.env.npm_config_registry ?? "https://registry.npmjs.org"
+    : process.argv[flag + 1];
+
+  rmSync(work, { recursive: true, force: true });
+  try {
+    const built = [];
+    for (const entry of GRAMMARS) built.push([entry, await compile(entry, registry)]);
+    const targets = await installAndCheck(built);
+    console.log("");
+    for (let i = 0; i < GRAMMARS.length; i++) {
+      const entry = GRAMMARS[i];
+      const bytes = readFileSync(targets[i]);
+      console.log(
+        "wrote " + targets[i] +
+          "\n  " + entry.package + " " + entry.version + "  ABI " + entry.abi + "  " +
+          statSync(targets[i]).size + " bytes  " + entry.function +
+          "\n  sha256 " + createHash("sha256").update(bytes).digest("hex"),
+      );
+    }
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+await main();

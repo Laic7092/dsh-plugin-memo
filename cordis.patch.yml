@@ -1,0 +1,10 @@
+# dsh-plugin-memo bundle patch: inserts this plugin into a profile's layer
+# stack when the profile lists this package as a bundle (or `dsh plugin
+# --profile <name> add dsh-plugin-memo`).
+#
+# No `isolate` realm is needed: this plugin publishes no service. It consumes
+# the host `tools` registry and, optionally, the host `commands` registry —
+# both live in the host composition, so it sits loose in the profile.
+- insert:
+    - id: memo
+      name: 'dsh-plugin-memo'
