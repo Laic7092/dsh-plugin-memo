@@ -187,10 +187,10 @@ test("the Memo view reads the session directory instead of asking for one", () =
 
   const tree = exported.MemoView(props);
   const text = textOf(tree).join(" ");
-
-  assert.match(text, /open-farm/, "the session's own directory is what the panel opens on");
-  // And the manual override stays available but is not what is in force.
-  assert.match(findProp(tree, "placeholder"), /open-farm/, "the placeholder names the session directory");
+  // The session's directory reaches the panel as the field's placeholder: the
+  // panel opens on it, and typing in the field is how a person overrides it.
+  assert.match(findProp(tree, "placeholder"), /open-farm/, "the session's own directory is what the panel opens on");
+  assert.equal(findProp(tree, "defaultValue"), undefined, "the override starts empty, so the session wins");
 });
 
 test("a session with no directory yet falls back rather than inventing one", () => {
@@ -235,17 +235,22 @@ test("the read switches report the host's live configuration", () => {
   const tree = exported.switchCards.readCard({ readGuard: false, refresh: true, exclude: ["addons"], readTools: ["read"] }, false, (patch) => seen.push(patch));
   const text = textOf(tree).join(" ");
 
-  assert.match(text, /读取与刷新（拦截关 · 复核开）/, "the summary states the switches it holds");
+  assert.match(text, /读取与刷新（拦截关 · 复核开 · token 估算）/, "the summary states the switches it holds");
   assert.match(text, /重复读拦截/);
   assert.match(text, /read/, "the intercepted tool names are stated, not editable here");
   assert.equal(findProp(tree, "defaultValue"), "addons", "the exclude field shows the current list");
 
   // The switches are wired to the host, not to local state.
   const checkboxes = elementsOf(tree).filter((node) => node.props && node.props.type === "checkbox");
-  assert.equal(checkboxes.length, 2, "one switch per boolean read setting");
-  assert.deepEqual(checkboxes.map((box) => box.props.checked), [false, true], "checked reflects the host");
+  assert.equal(checkboxes.length, 3, "one switch per boolean read setting");
+  assert.deepEqual(checkboxes.map((box) => box.props.checked), [false, true, false], "checked reflects the host");
   checkboxes[0].props.onChange({ target: { checked: true } });
   assert.deepEqual(seen, [{ readGuard: true }], "flipping a switch posts exactly that key");
+
+  // The token counter is one of them, and it is a string on the wire, not a
+  // boolean: the host refuses a value it does not recognise.
+  checkboxes[2].props.onChange({ target: { checked: true } });
+  assert.deepEqual(seen[1], { tokenizer: "exact" }, "the exact counter is asked for by name");
 });
 
 test("the tool switches are grouped by domain and wired to the host", () => {
@@ -290,12 +295,34 @@ test("the tool switches are grouped by domain and wired to the host", () => {
 
 test("the two switch cards come back together, in order", () => {
   const { exported } = loadClient();
-  const cards = exported.configCardFor({ readGuard: true, refresh: true, exclude: [], readTools: ["read"], tools: CATALOGUE }, false, () => {});
+  const cards = exported.configCardFor({ readGuard: true, refresh: true, tokenizer: "exact", exclude: [], readTools: ["read"], tools: CATALOGUE }, false, () => {});
   assert.deepEqual(
     cards.map((card) => textOf(card.children[0]).join("")),
-    ["工具开关（7/8 开启）", "读取与刷新（拦截开 · 复核开）"],
+    ["工具开关（7/8 开启）", "读取与刷新（拦截开 · 复核开 · token 精确）"],
     "the tools first, then the host's read switches",
   );
+});
+
+test("the panel asks the host to revalidate in the counter it has", () => {
+  const { exported, window: fake } = loadClient();
+  const { ask } = exported.switchConfig;
+  const calls = [];
+  withWindow(fake, () => {
+    fake.fetch = (url) => {
+      calls.push(url);
+      return Promise.resolve({ json: () => Promise.resolve({ ok: true, config: {} }) });
+    };
+    ask("/memo/state", { root: "/tmp/p", refresh: true, tokenizer: "exact" });
+    assert.match(calls[0], /refresh=1/);
+    assert.match(calls[0], /tokenizer=exact/, "the unit has to reach the host, or nothing rebuilds");
+    // And a nonsense one is not forwarded: the host refuses what it cannot do,
+    // and a panel that sent it anyway would turn a switch into a 400.
+    ask("/memo/state", { root: "/tmp/p", refresh: true, tokenizer: "wordpiece" });
+    assert.doesNotMatch(calls[1], /tokenizer/);
+    // The ordinary read still carries no refresh, so nothing rebuilds by accident.
+    ask("/memo/state", { root: "/tmp/p" });
+    assert.doesNotMatch(calls[2], /refresh/);
+  });
 });
 
 test("a remembered switch is stored as a patch, and replayed only against a host that knows it", () => {
@@ -418,8 +445,32 @@ test("the index card reports counts, origin, and freshness", () => {
   assert.match(freshText, /代码索引/);
   assert.match(freshText, /28/);
   assert.match(freshText, /247/);
+  assert.match(freshText, /60,291/, "the count is on screen, grouped like every other number");
   assert.match(freshText, /ts \(24 files\)/);
   assert.match(freshText, /索引与磁盘一致/);
+  // No unit reported: the hedged label, because the panel cannot know better.
+  assert.match(freshText, /估算 tokens/);
+  assert.doesNotMatch(freshText, /精确 tokens/);
+
+  // An index counted by the tokenizer says so — the count is the same field,
+  // and a panel that kept calling it an estimate would be lying about a number
+  // the host went to the trouble of measuring.
+  const exactText = textOf(exported.cards.indexCard({
+    present: true,
+    readable: true,
+    fileCount: 28,
+    symbolCount: 247,
+    totalTokens: 60291,
+    tokens: "exact",
+    symbolSource: "ts (24 files)",
+    scannedAt: "2026-09-15T16:40:27.792Z",
+    staleChanged: 0,
+    staleMissing: 0,
+    staleChangedFiles: [],
+    staleMissingFiles: [],
+  })).join(" ");
+  assert.match(exactText, /精确 tokens/);
+  assert.doesNotMatch(exactText, /估算 tokens/);
 
   const staleText = textOf(exported.cards.indexCard({
     present: true,

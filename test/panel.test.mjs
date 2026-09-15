@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import { appendNote } from "../lib/journal.js";
 import { panelScan, panelState } from "../lib/panel.js";
 import { patchStatus, writeStatus } from "../lib/status.js";
 import { createMemoDir, isFile, memoPaths, stamp } from "../lib/store.js";
+import { countTokens, loadTokenizer } from "../lib/tokenizer.js";
 
 /** A real directory with one source file and deliberately no `.memo/`. */
 function project() {
@@ -20,6 +21,12 @@ function project() {
 
 /** The tool catalogue as a flat list of names — what the card renders in rows. */
 const switchNames = (config) => config.tools.flatMap((group) => group.tools.map((entry) => entry.name));
+
+/** The per-file token counts as they landed in the project's index.json. */
+function indexedTokens(root) {
+  const index = JSON.parse(readFileSync(join(root, ".memo", "index.json"), "utf8"));
+  return index.files["src/a.ts"].tokens;
+}
 
 /** Everything in `config` except the grouped tool catalogue. */
 const readSwitches = (config) => ({ ...config, tools: undefined });
@@ -53,7 +60,7 @@ test("panelState reports an initialized project", async () => {
     assert.equal(state.initialized, true);
     // The switches travel with the state, because the panel renders them from
     // this one response. A missing `config` took the whole view down once.
-    assert.deepEqual(readSwitches(state.config), { readGuard: false, refresh: false, exclude: [], readTools: [], tools: undefined }, "config is present and echoes what the host was handed");
+    assert.deepEqual(readSwitches(state.config), { readGuard: false, refresh: false, tokenizer: "estimated", exclude: [], readTools: [], tools: undefined }, "config is present and echoes what the host was handed");
     // A state object that never heard of per-tool switches reports every tool
     // on, which is what the host actually did with it.
     assert.deepEqual(state.config.tools.map((group) => group.id), ["memory", "index", "bugs"]);
@@ -103,7 +110,7 @@ test("the panel reports the switches it was handed, not its own defaults", async
   try {
     seed(root);
     const state = await panelState(root, { readGuard: true, refresh: true, exclude: ["addons"], readTools: ["read", "view"], tools: { memo_scan: false } }, null);
-    assert.deepEqual(readSwitches(state.config), { readGuard: true, refresh: true, exclude: ["addons"], readTools: ["read", "view"], tools: undefined });
+    assert.deepEqual(readSwitches(state.config), { readGuard: true, refresh: true, tokenizer: "estimated", exclude: ["addons"], readTools: ["read", "view"], tools: undefined });
     // The host's live values, not a copy that could drift from them.
     assert.notEqual(state.config.exclude, undefined);
     // One tool switched off, and only that one: the panel is reporting state,
@@ -144,6 +151,59 @@ test("panelState refuses a root it cannot interpret", async () => {
   const scanned = await panelScan("some/relative/path", {}, null);
   assert.equal(scanned.ok, false);
   assert.match(scanned.error, /absolute/);
+});
+
+test("panelScan counts exactly when the panel asks for it", async () => {
+  const root = project();
+  try {
+    seed(root);
+    const built = await panelScan(root, { tokenizer: "exact" }, null);
+    assert.equal(built.ok, true);
+    assert.equal(built.index.tokens, "exact");
+    // The count in the index is the tokenizer's, not the 4-chars estimate the
+    // host would have used by default — this is the whole wiring under test.
+    const source = readFileSync(join(root, "src", "a.ts"), "utf8");
+    const counted = loadTokenizer().encode(source).length;
+    assert.notEqual(counted, Math.ceil(source.length / 4), "the fixture must tell the two counters apart");
+    assert.equal(indexedTokens(root), counted);
+    // And the panel's own config echo carries the switch, so the card can state it.
+    const state = await panelState(root, { tokenizer: "exact" }, null);
+    assert.equal(state.config.tokenizer, "exact");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the panel revalidates in the counter it is told to, and says which one it has", async () => {
+  const root = project();
+  try {
+    seed(root);
+    const source = readFileSync(join(root, "src", "a.ts"), "utf8");
+    const exact = countTokens(source);
+    const estimate = Math.ceil(source.length / 4);
+    assert.notEqual(exact, estimate, "the fixture must tell the two counters apart");
+
+    // Built the default way, and the panel reports the guess as a guess.
+    await panelScan(root, {}, null);
+    assert.equal(indexedTokens(root), estimate);
+    const guessed = await panelState(root, {}, null);
+    assert.equal(guessed.index.tokens, "estimated");
+    assert.equal(guessed.index.totalTokens, estimate);
+
+    // Asked to revalidate exactly, the panel does not merely re-read: nothing
+    // moved on disk, so this has to rebuild because the unit changed.
+    const switched = await panelState(root, { refresh: true, tokenizer: "exact" }, null);
+    assert.equal(switched.index.tokens, "exact");
+    assert.equal(switched.index.totalTokens, exact, "the number on screen is the new count");
+    assert.equal(indexedTokens(root), exact, "and it was written back, not just reported");
+
+    // Back the other way needs no special case: the stamp decides.
+    const back = await panelState(root, { refresh: true, tokenizer: "estimated" }, null);
+    assert.equal(back.index.tokens, "estimated");
+    assert.equal(back.index.totalTokens, estimate);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("panelScan refuses a directory that has no .memo/ yet", async () => {

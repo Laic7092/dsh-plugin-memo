@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+
+import { countTokens } from "../lib/tokenizer.js";
 import { join } from "node:path";
 
 /**
@@ -161,6 +163,78 @@ const switchState = (config) => Object.fromEntries(config.tools.flatMap((group) 
 /** Everything in `config` except the grouped tool catalogue. */
 const readSwitches = (config) => ({ ...config, tools: undefined });
 
+test("the state route revalidates in the counter it is asked for", { skip }, async () => {
+  const base = scratchProject();
+  try {
+    const root = join(base, "proj");
+    mkdirSync(join(root, ".memo"), { recursive: true });
+    const source = "export function alpha() {\n  return 1;\n}\n";
+    writeFileSync(join(root, "a.ts"), source, "utf8");
+    const exact = countTokens(source);
+    const estimate = Math.ceil(source.length / 4);
+    assert.notEqual(exact, estimate, "the fixture must tell the two counters apart");
+
+    const fake = fakeContext();
+    host.apply(fake.ctx, {});
+    const state = fake.routes.find((route) => route.path === "/memo/state");
+    const scan = fake.routes.find((route) => route.path === "/memo/scan");
+    assert.ok(state !== undefined && scan !== undefined, "both routes are registered");
+
+    const built = await request(scan, { method: "POST", url: `/memo/scan?root=${encodeURIComponent(root)}` });
+    assert.equal(built.status, 200);
+    assert.equal(built.json.index.tokens, "estimated");
+
+    // The panel names the counter in the same request that asks for the sweep.
+    const asked = await request(state, { url: `/memo/state?refresh=1&tokenizer=exact&root=${encodeURIComponent(root)}` });
+    assert.equal(asked.status, 200);
+    assert.equal(asked.json.index.tokens, "exact", "the index was rebuilt in the unit the panel asked for");
+    assert.equal(asked.json.index.totalTokens, exact);
+
+    // The counter the panel names is the host's counter from then on, so the
+    // next plain load does not rebuild the index back to the other unit.
+    const plain = await request(state, { url: `/memo/state?refresh=1&root=${encodeURIComponent(root)}` });
+    assert.equal(plain.json.config.tokenizer, "exact", "the choice stuck");
+    assert.equal(plain.json.index.tokens, "exact", "and nothing was rebuilt back");
+
+    // A counter this host cannot honour is dropped, not guessed at.
+    const nonsense = await request(state, { url: `/memo/state?refresh=1&tokenizer=wordpiece&root=${encodeURIComponent(root)}` });
+    assert.equal(nonsense.status, 200);
+    assert.equal(nonsense.json.config.tokenizer, "exact", "a nonsense name changes nothing");
+    assert.equal(nonsense.json.index.tokens, "exact");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("the settings route round-trips the token counter and refuses a name it does not know", { skip }, async () => {
+  const base = scratchProject();
+  try {
+    writeFileSync(join(base, "a.ts"), "export const a = 1\n", "utf8");
+    const fake = fakeContext();
+    host.apply(fake.ctx, {});
+    const config = fake.routes.find((route) => route.path === "/memo/config");
+    assert.ok(config !== undefined, "the config route is registered");
+
+    // The default is the estimate, and it says so.
+    const initial = await request(config);
+    assert.equal(initial.json.config.tokenizer, "estimated");
+
+    const exact = await request(config, { method: "POST", body: JSON.stringify({ tokenizer: "exact" }) });
+    assert.equal(exact.status, 200);
+    assert.equal(exact.json.config.tokenizer, "exact");
+
+    // A tokenizer this host cannot honour is refused, not silently downgraded:
+    // the panel would otherwise show a switch that is on and doing nothing.
+    const wrong = await request(config, { method: "POST", body: JSON.stringify({ tokenizer: "wordpiece" }) });
+    assert.equal(wrong.status, 400);
+    assert.match(wrong.json.error, /tokenizer must be one of/);
+    const after = await request(config);
+    assert.equal(after.json.config.tokenizer, "exact", "a refused patch changes nothing");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("host half registers eight tools and one human command", { skip }, () => {
   assert.equal(host.name, "dsh-plugin-memo");
   assert.deepEqual(host.inject, ["tools"]);
@@ -240,7 +314,7 @@ test("the switches change the host at runtime, and the guard really comes back",
     // What the panel is told is the host's live state, not its own wish.
     const initial = await request(config);
     assert.equal(initial.status, 200);
-    assert.deepEqual(readSwitches(initial.json.config), { readGuard: false, refresh: true, exclude: ["generated"], readTools: ["read"], tools: undefined });
+    assert.deepEqual(readSwitches(initial.json.config), { readGuard: false, refresh: true, tokenizer: "estimated", exclude: ["generated"], readTools: ["read"], tools: undefined });
 
     // Flip it on: the listeners appear, and the guard actually refuses.
     const on = await request(config, { method: "POST", body: JSON.stringify({ readGuard: true }) });
@@ -539,7 +613,7 @@ test("the settings panel routes answer JSON, and the write route is guarded", { 
     assert.equal(filled.json.index.fileCount, 1);
     // The switches ride along with the state the panel is already reading. When
     // they did not, the view crashed on the missing field.
-    assert.deepEqual(readSwitches(filled.json.config), { readGuard: true, refresh: true, exclude: [], readTools: ["read"], tools: undefined });
+    assert.deepEqual(readSwitches(filled.json.config), { readGuard: true, refresh: true, tokenizer: "estimated", exclude: [], readTools: ["read"], tools: undefined });
     // The catalogue and the registrations are the same set: a tool with no
     // switch would be unreachable from the panel, and a switch with no tool
     // would be a row that lies about what the host has.
