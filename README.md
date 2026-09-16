@@ -9,7 +9,14 @@ dsh plugin --profile web add Laic7092/dsh-plugin-memo
 # 重启 profile 后生效
 ```
 
-`lib/` 随仓库提交，安装后直接可用；`tree-sitter-wasm` / `web-tree-sitter` 是 optional，装不上只回退行内规则。装好后模型工具里只有一个 `memo`，人侧是 `/memo <命令行>`，两者共用同一份实现。
+`lib/` 不入库，安装时由 `prepare` 编译。pnpm 默认拦截 git 依赖的构建脚本，首次 `add` 会提示 `dsh-plugin-memo` 的构建被忽略；把 `dsh-plugin-memo: true` 加到 profile 目录（`$DSH_HOME/profiles/web/`）的 `pnpm-workspace.yaml` 的 `allowBuilds` 下，再跑一次安装命令：
+
+```yaml
+allowBuilds:
+  dsh-plugin-memo: true
+```
+
+`tree-sitter-wasm` / `web-tree-sitter` 是 optional，装不上只回退行内规则。装好后模型工具里只有一个 `memo`，人侧是 `/memo <命令行>`，两者共用同一份实现。
 
 不要把这个插件再往 profile 的 `cordis.patch.yml` 里 insert 一遍：本包声明了 `dsh.bundle.patch`，`dsh plugin add` 已经写进 `dsh.profile.bundles`；重复 insert 会因 `duplicate loader entry id: memo` 让整个 profile 起不来。要改配置就写一条不带 insert 的定向 patch：
 
@@ -83,7 +90,7 @@ npm run check    # tsc --noEmit
 npm test         # build 后运行 102 个测试
 ```
 
-`src/` 是 TypeScript 源码，`lib/` 是提交进仓库的编译产物（git 安装不会替用户跑构建），`tokenizer/` 是随包的 DeepSeek V4 词表。`tsconfig.json` 开了 `strict`，但 `noImplicitAny` / `strictNullChecks` 暂关。
+`src/` 是 TypeScript 源码，`lib/` 是 `npm run build` 的产物（不入库），`tokenizer/` 是随包的 DeepSeek V4 词表。`tsconfig.json` 开了 `strict`，但 `noImplicitAny` / `strictNullChecks` 暂关。
 
 `test/tokenizer-vectors.json` 是 60 组逐 id 基准，由 HuggingFace `tokenizers` 读同一份词表生成。重建：
 
