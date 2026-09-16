@@ -1,6 +1,3 @@
 # Installed dependencies (including the optional tree-sitter packages and the
 # @deepseek-ai/dsh-tools link a host provides). Nothing here is committed.
 node_modules/
-
-# Compiler output; npm run build (and prepare on install) regenerates it.
-lib/
