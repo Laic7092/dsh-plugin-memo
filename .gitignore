@@ -11,3 +11,7 @@ lib/
 # Scratch cache from packing locally (npm pack --cache ./.npm-cache), because the
 # user-level npm cache is not writable from every sandbox this repo runs in.
 .npm-cache/
+
+# Local pack output (the profile installs from this file): a build artifact,
+# and the one file in here that must exist on disk but never in history.
+*.tgz
