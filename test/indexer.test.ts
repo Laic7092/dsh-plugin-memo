@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildIndex, buildMap, estimateTokens, fileDetail, findInIndex, INDEX_VERSION, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "../src/indexer.ts";
+import { buildIndex, buildMap, collectCalls, estimateTokens, fileDetail, findInIndex, INDEX_VERSION, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "../src/indexer.ts";
 import { createTsAnalyzer } from "../src/ts-symbols.ts";
 
 const AUTH = [
@@ -423,4 +423,30 @@ test("an index from before the grammar stamp rebuilds itself once", async () => 
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+test("a call is reported on the line it is written on, comments or not", () => {
+  const source = [
+    "/**",
+    " * A block comment of the kind every module here opens with.",
+    " * It spans several lines, and nothing in it is code.",
+    " */",
+    "export function run() {",
+    "  const s = new Set();",
+    "  s.add(1);",
+    "}",
+    "",
+    "// A whole-line comment, one line long.",
+    "run();",
+  ].join(String.fromCharCode(10));
+  const rows = collectCalls(source.split(String.fromCharCode(10)), "js", [
+    { name: "run", kind: "function", line: 5, endLine: 8 },
+  ]);
+  const lineOf = (name: string) => rows.find((call) => call.name === name)?.line;
+  // Before the comment pass kept its newlines these were 3, 4 and 6: every call
+  // below a block comment slid up by the height of the comment, and the answer
+  // to "who calls this" pointed at a line that is prose.
+  assert.equal(lineOf("Set"), 6, "the constructor is on line 6");
+  assert.equal(lineOf("add"), 7);
+  assert.equal(lineOf("run"), 11, "a call after a one-line comment is exact too");
+  assert.equal(rows.find((call) => call.name === "run")?.caller, null, "a top-level call has no enclosing function");
 });

@@ -354,6 +354,10 @@ function fenceAt(line) {
  * function exists -- prose about comment syntax is still prose.
  *
  * @param text - the file, lines joined with newlines.
+ * Lines are preserved: a comment leaves as many newlines as it spanned, because
+ * the call-site pass counts by line index and a collapsed comment would move
+ * every call below it onto a line the file does not have.
+ *
  * @param neutralize - when true, string contents are replaced with empty
  *   quotations. Off for import scanning (the specifier *is* the string) and on
  *   for the declaration pass, which wants a literal to stop looking like code.
@@ -370,7 +374,13 @@ export function stripComments(text: string, neutralize: boolean): string {
     }
     if (ch === "/" && next === "*") {
       const close = text.indexOf("*" + "/", i + 2);
-      i = close === -1 ? text.length : close + 2;
+      const end = close === -1 ? text.length : close + 2;
+      const inside = text.slice(i, end);
+      // The comment goes; the lines it occupied stay. A caller told a call is
+      // on line 12 of a file where line 12 is still a comment has been handed a
+      // wrong answer, and call sites are counted by line index.
+      for (let k = inside.indexOf(String.fromCharCode(10)); k !== -1; k = inside.indexOf(String.fromCharCode(10), k + 1)) out += String.fromCharCode(10);
+      i = end;
       continue;
     }
     if (ch === "\"" || ch === "'" || ch === "`") {
