@@ -16,6 +16,7 @@
   },
   "files": [
     "lib/",
+    "tokenizer/",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -29,15 +30,20 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "*"
-  },
-  "scripts": {
-    "check": "node --check lib/index.js && node --check lib/cli.js && node --check lib/store.js && node --check lib/status.js && node --check lib/bugs.js && node --check lib/journal.js && node --check lib/indexer.js && node --check lib/reads.js && node --check lib/ts-symbols.js && node --check lib/panel.js && node --check lib/tokenizer.js && node --check scripts/count-tokens.mjs && node --check scripts/count-tool-tokens.mjs && node --check lib/client.js && node --check scripts/build-godot-grammars.mjs",
-    "build:grammars": "node scripts/build-godot-grammars.mjs",
-    "test": "node --test test/store.test.mjs test/cli.test.mjs test/indexer.test.mjs test/godot.test.mjs test/guard.test.mjs test/panel.test.mjs test/client.test.mjs test/host.test.mjs test/cordis.test.mjs test/tokenizer.test.mjs"
+    "@deepseek-ai/dsh-tools": "0.1.6-alpha.1"
   },
   "optionalDependencies": {
-    "web-tree-sitter": "^0.24.7",
-    "tree-sitter-wasms": "^0.1.13"
+    "tree-sitter-wasm": "^2.0.1",
+    "web-tree-sitter": "^0.25.10"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.ts",
+    "prepare": "npm run build"
   }
 }

@@ -1,0 +1,659 @@
+/**
+ * dsh-plugin-memo — the CLI half.
+ *
+ * One grammar, two callers. The model reaches this file through a single tool
+ * whose only argument is a command line; a person reaches the same grammar
+ * through `/memo <line>` in the input box. Everything either surface can
+ * do lives here, so the two can never drift: there is no second implementation
+ * of "search the bug log" for the human command to fall behind on.
+ *
+ * Why a command line rather than one tool per operation: every registered tool
+ * is paid for by *every* request — its description and its parameter schema are
+ * part of the model's standing context whether or not this turn uses it. Eight
+ * tools meant eight descriptions on every turn to buy eight operations that a
+ * session uses a handful of times. One tool with one string argument costs one
+ * description, and `memo help` hands the grammar over only when it is wanted.
+ *
+ * The parser is deliberately forgiving — flags in any order, `--flag value`
+ * or `--flag=value`, quotes for text with spaces, unquoted words joined for
+ * the positional arguments — because a syntax a model gets wrong is a turn
+ * spent on nothing. Anything it cannot honour is refused with the usage of the
+ * command it was trying to run.
+ *
+ * @module dsh-plugin-memo/cli
+ */
+import { basename, resolve } from "node:path";
+import { appendBug, loadBugs, recentBugs, searchBugs } from "./bugs.ts";
+import { buildIndex, buildMap, fileDetail, findInIndex, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "./indexer.ts";
+import { appendNote, readNotes } from "./journal.ts";
+import { patchStatus, readStatus, sectionBody, STATUS_SECTIONS, writeStatus } from "./status.ts";
+import { INDEX_MAX_BYTES, clampInt, createMemoDir, findProjectRoot, isFile, memoPaths, readJson, stamp, statOrNull, writeJsonAtomic } from "./store.ts";
+import type { MemoIndex, MemoState } from "./types.ts";
+
+const fmt = (n) => Number(n ?? 0).toLocaleString("en-US");
+
+function lines(...parts) {
+  return parts.filter((part) => typeof part === "string" && part.length > 0).join("\n");
+}
+
+/**
+ * A token count, worded for the unit it is actually in. Two counters produce
+ * these numbers and they disagree by design, so "约" is not decoration: it is
+ * the difference between a measurement and a documented guess. The index says
+ * which one it holds; a caller that did not say keeps the hedged form.
+ */
+function tokenAmount(count, unit) {
+  return unit === "exact" ? `${fmt(count)} tokens` : `约 ${fmt(count)} tokens`;
+}
+
+//#region rendering — the text both callers read
+
+/** STATUS.md as a reader takes it: the four sections, labelled and attributed. */
+function renderStatusText(project, paths, status, notes, bugs) {
+  const out = [`memo · ${project.root}`];
+  const dirName = basename(paths.dir);
+  out.push(status.present
+    ? `STATUS.md 最后更新：${status.updated ?? "未知"}`
+    : `还没有 ${dirName}/STATUS.md —— 用 memo handoff 写第一份。`);
+  out.push("");
+  if (status.present) {
+    for (const title of STATUS_SECTIONS) {
+      const body = sectionBody(status, title);
+      out.push(`## ${title}`, body ?? "（空）", "");
+    }
+    const extra = status.sections.filter((section) => !STATUS_SECTIONS.includes(section.title));
+    for (const section of extra) out.push(`## ${section.title}`, section.body || "（空）", "");
+  }
+
+  out.push(bugs.present ? `bug 记忆：${bugs.bugs.length} 条` : "bug 记忆：还没建（memo bug-log 会创建）");
+  for (const bug of recentBugs(bugs.bugs, 3)) {
+    out.push(`  ${bug.id} ×${bug.occurrences ?? 1}  ${bug.error_message}`);
+    if (bug.fix) out.push(`      fix: ${bug.fix}`);
+  }
+
+  const indexStat = statOrNull(paths.index);
+  out.push(indexStat === null
+    ? "代码索引：还没建（memo scan 会建）"
+    : `代码索引：${fmt(indexStat.size)} 字节，改于 ${new Date(indexStat.mtimeMs).toISOString()}`);
+
+  out.push("", notes.present ? `最近动作（${notes.notes.length}/${notes.total} 条）` : "最近动作：还没有");
+  for (const note of notes.notes) out.push(`  ${note.at}  [${note.kind}]  ${note.text}`);
+  return `${out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
+}
+
+function renderBugs(term, found) {
+  if (found.length === 0) return `没有匹配 "${term}" 的历史修复。`;
+  const out = [`匹配 "${term}"：${found.length} 条`, ""];
+  for (const bug of found) {
+    out.push(`${bug.id}  ×${bug.occurrences ?? 1}  ${bug.error_message}`);
+    if (bug.root_cause) out.push(`  cause: ${bug.root_cause}`);
+    if (bug.fix) out.push(`  fix:   ${bug.fix}`);
+    if (bug.file) out.push(`  file:  ${bug.file}${Number.isFinite(bug.line) ? ":" + bug.line : ""}`);
+    if (Array.isArray(bug.tags) && bug.tags.length > 0) out.push(`  tags:  ${bug.tags.join(", ")}`);
+    out.push("");
+  }
+  return `${out.join("\n").trimEnd()}\n`;
+}
+
+function renderFileDetail(detail) {
+  const out = [
+    `${detail.relPath}  ${detail.lines} 行 · 约 ${fmt(detail.tokens)} tokens · importance ${Number(detail.importance ?? 0).toFixed(2)}`,
+  ];
+  if (detail.description) out.push(detail.description);
+  out.push("");
+  if (detail.symbols.length === 0) out.push("（这个文件里没有提取到符号）");
+  for (const symbol of detail.symbols) {
+    out.push(`  ${String(symbol.line).padStart(4)}-${String(symbol.endLine).padEnd(4)}  ${symbol.kind.padEnd(9)} ${symbol.name}`);
+  }
+  return `${out.join("\n").trimEnd()}\n`;
+}
+
+function renderFind(query, result, meta) {
+  if (result.matches.length === 0) {
+    return `索引里没有匹配 "${query}" 的符号或路径（索引共 ${fmt(meta.fileCount)} 个文件，${fmt(meta.symbolCount)} 个符号）。`;
+  }
+  const out = [
+    `匹配 "${query}" · ${result.matches.length}/${fmt(result.total)} 条 · 约 ${fmt(result.spent)}/${fmt(result.budget)} tokens${result.truncated ? "（被预算截断）" : ""}`,
+    "",
+  ];
+  for (const match of result.matches) {
+    out.push(`${match.line}  ${match.kind}${match.symbol ? " " + match.symbol.name : ""}  [${match.importance.toFixed(2)}]`);
+    if (match.description) out.push(`    ${match.description}`);
+  }
+  return `${out.join("\n").trimEnd()}\n`;
+}
+
+function renderMap(map) {
+  if (map.mode === "rollup") {
+    if (map.dirs.length === 0) return "索引里还没有文件——先跑 memo scan。";
+    const out = [`项目地图（按目录）· ${tokenAmount(map.spent, map.tokens)}/${fmt(map.budget)} tokens`, ""];
+    for (const bucket of map.dirs) {
+      out.push(`${bucket.dir}/  ${bucket.files} 个文件 · ${tokenAmount(bucket.tokens, map.tokens)} · 代表：${bucket.best ? bucket.best.relPath : "-"}`);
+    }
+    if (map.truncated) out.push("", `（另有 ${map.total - map.dirs.length} 个目录未列出）`);
+    return `${out.join("\n").trimEnd()}\n`;
+  }
+  if (map.files.length === 0) return `没有匹配 "${map.focus}" 的文件。`;
+  const out = [
+    `聚焦地图 "${map.focus}" · ${map.files.length}/${fmt(map.total)} 个文件 · ${tokenAmount(map.spent, map.tokens)}/${fmt(map.budget)} tokens${map.truncated ? "（被预算截断）" : ""}`,
+    "",
+  ];
+  for (const file of map.files) {
+    out.push(`${file.relPath}  [${Number(file.importance ?? 0).toFixed(2)}]  ${file.symbols} 符号 · ${tokenAmount(file.tokens, map.tokens)}`);
+    if (file.description) out.push(`    ${file.description}`);
+  }
+  return `${out.join("\n").trimEnd()}\n`;
+}
+
+function renderScan(paths, index: MemoIndex, stale, durationMs) {
+  const meta = indexMeta(index);
+  const out = [
+    `已重建索引 · ${paths.index}`,
+    `${fmt(meta.fileCount)} 个文件 · ${fmt(meta.symbolCount)} 个符号 · ${tokenAmount(meta.totalTokens, meta.tokens)} · 用时 ${durationMs} ms`,
+    `符号来源：${index.symbolSource ?? "regex"}（tree-sitter 升级 ${TS_MIN_TOKENS} tokens 以上的文件；其余与失败回退都用行内启发式）`,
+    "",
+  ];
+  if (stale.changedCount > 0 || stale.missingCount > 0) {
+    out.push(`索引落后于磁盘：${stale.changedCount} 个文件改过、${stale.missingCount} 个已消失。`);
+    for (const rel of stale.changed.slice(0, 5)) out.push(`  改过  ${rel}`);
+    for (const rel of stale.missing.slice(0, 5)) out.push(`  没了  ${rel}`);
+  } else {
+    out.push("索引与磁盘一致。");
+  }
+  const top = Object.entries(index.files)
+    .sort((a, b) => b[1].importance - a[1].importance)
+    .slice(0, 5);
+  if (top.length > 0) {
+    out.push("", "最重要的文件（import 图 PageRank）：");
+    for (const [rel, file] of top) {
+      out.push(`  ${file.importance.toFixed(2)}  ${rel}  ${file.symbols.length} 符号${file.description ? "  " + file.description : ""}`);
+    }
+  }
+  return `${out.join("\n").trimEnd()}\n`;
+}
+
+/** One trailing line saying what the automatic revalidation did, or "". */
+function renderSync(sync) {
+  if (sync === null || sync === undefined) return "";
+  if (sync.failed !== undefined) return `（索引自动同步失败：${sync.failed} —— 用 memo scan 重建）`;
+  if (sync.rebuilt === true) return `（索引格式已升级，整份重建：${fmt(sync.changed)} 个文件）`;
+  if (sync.changed === 0) return "";
+  const parts = [];
+  if (sync.added.length > 0) parts.push(`+${sync.added.length} 新文件`);
+  if (sync.updated.length > 0) parts.push(`~${sync.updated.length} 改写`);
+  if (sync.removed.length > 0) parts.push(`-${sync.removed.length} 移除`);
+  return `（索引已自动同步：${parts.join(" · ")}${sync.writeError ? "；但写回失败：" + sync.writeError : ""}）`;
+}
+
+/** Append the sync line to an answer, when there is one. */
+function withSync(text, sync) {
+  const line = renderSync(sync);
+  return line.length === 0 ? text : `${text.trimEnd()}\n${line}`;
+}
+
+//#endregion
+
+//#region the index — read side
+
+function loadIndex(paths) {
+  if (!isFile(paths.index)) return { ok: false, index: null, error: `${paths.index} 还不存在——先跑 memo scan` };
+  const stat = statOrNull(paths.index);
+  if (stat !== null && stat.size > INDEX_MAX_BYTES) {
+    return { ok: false, index: null, error: "index.json 大得不正常，重新跑一次 memo scan" };
+  }
+  const file = readJson(paths.index, null, INDEX_MAX_BYTES);
+  if (!file.ok) return { ok: false, index: null, error: file.error };
+  const value = file.value;
+  if (!value || typeof value !== "object" || typeof value.files !== "object" || value.files === null) {
+    return { ok: false, index: null, error: "index.json 的形状看不懂——重新跑一次 memo scan" };
+  }
+  return { ok: true, index: value, error: null };
+}
+
+/**
+ * Load the index and, unless turned off, bring it up to date before answering.
+ *
+ * Revalidating here rather than in a watcher is deliberate: the read path is
+ * the only place that actually needs the index to be right, and a watcher would
+ * have to enumerate every way a file can change — while missing the ones that
+ * do not go through the harness at all. See `refreshIndex` for what the sweep
+ * costs and why it is stronger than a write hook.
+ */
+async function openIndex(paths, state, analyzer) {
+  const loaded = loadIndex(paths);
+  if (!loaded.ok || !state.refresh) return { ...loaded, sync: null };
+  let fresh;
+  try {
+    fresh = await refreshIndex(loaded.index, { exclude: state.exclude, analyzer, tokenizer: state.tokenizer });
+  } catch (error) {
+    // A refresh that throws must not cost the caller its answer: hand back the
+    // index we have and say plainly that it may be behind.
+    return { ...loaded, sync: { failed: error && error.message ? error.message : String(error) } };
+  }
+  if (fresh.changed > 0) {
+    const write = writeJsonAtomic(paths.index, fresh.index);
+    // Answer from memory either way; only the on-disk copy is at stake.
+    if (!write.ok) return { ok: true, index: fresh.index, error: null, sync: { ...fresh, writeError: write.error } };
+  }
+  return { ok: true, index: fresh.index, error: null, sync: fresh };
+}
+
+//#endregion
+
+//#region the grammar
+
+/**
+ * Command and flag names are matched with their separators removed, so
+ * `bug-search`, `bug_search` and `bugsearch` are one command. A model that
+ * reaches for a spelling it saw somewhere else still gets its answer, and the
+ * help text keeps one spelling because that is the one worth learning.
+ */
+function loose(name) {
+  return String(name ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** A flag value, coerced the way its flag says. */
+function coerceFlag(value, flag, given) {
+  if (flag.kind === "int") {
+    const parsed = Number.parseInt(String(value).trim(), 10);
+    if (!Number.isFinite(parsed)) return { ok: false, error: `--${given} 要一个整数，收到 ${JSON.stringify(value)}` };
+    return { ok: true, value: parsed };
+  }
+  return { ok: true, value: String(value) };
+}
+
+/** The `--root` flag every command accepts, kept out of each command's own list. */
+const ROOT_FLAG = { root: { kind: "string", hint: "PATH", description: "项目根目录（绝对路径）。默认：会话工作目录，再往上找最近的 .memo/ 或 .git" } };
+
+/**
+ * Split a command line into words, honouring quotes.
+ *
+ * Text with spaces is the common case for this plugin — a symptom, a handoff
+ * paragraph — so quotes matter more here than they do in a shell that mostly
+ * passes paths around. An unterminated quote is an error rather than a silent
+ * best-effort split: guessing would run a command with half its text.
+ */
+export function splitCommandLine(line) {
+  const tokens = [];
+  const text = String(line ?? "");
+  let current = null;
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === quote) { quote = null; continue; }
+      if (ch === "\\" && quote === '"' && i + 1 < text.length) { i += 1; current = (current ?? "") + text[i]; continue; }
+      current = (current ?? "") + ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; current = current ?? ""; continue; }
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      if (current !== null) { tokens.push(current); current = null; }
+      continue;
+    }
+    if (ch === "\\" && i + 1 < text.length) { i += 1; current = (current ?? "") + text[i]; continue; }
+    current = (current ?? "") + ch;
+  }
+  if (quote !== null) return { ok: false, error: `引号没闭合：${quote}` };
+  if (current !== null) tokens.push(current);
+  return { ok: true, tokens };
+}
+
+/** Parse one command's arguments against its own flag list. */
+function parseArgs(tokens, command) {
+  const flags: Record<string, any> = {};
+  const rest = [];
+  const known = { ...command.flags, ...ROOT_FLAG };
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === "--help" || token === "-h") return { help: true };
+    if (token.startsWith("--") && token.length > 2) {
+      let name = token.slice(2);
+      let inline = null;
+      const eq = name.indexOf("=");
+      if (eq !== -1) { inline = name.slice(eq + 1); name = name.slice(0, eq); }
+      const asked = loose(name);
+      const canonical = Object.keys(known).find((key) => loose(key) === asked || (known[key].aliases ?? []).some((alias) => loose(alias) === asked));
+      if (canonical === undefined) return { error: `不认识的选项 --${name}` };
+      const flag = known[canonical];
+      let value = inline;
+      if (value === null) {
+        if (i + 1 >= tokens.length) return { error: `--${name} 后面缺一个值` };
+        i += 1;
+        value = tokens[i];
+      }
+      const coerced = coerceFlag(value, flag, name);
+      if (!coerced.ok) return { error: coerced.error };
+      if (flag.kind === "list") flags[canonical] = [...(flags[canonical] ?? []), coerced.value];
+      else flags[canonical] = coerced.value;
+      continue;
+    }
+    // A bare `-` or a negative number is text, not a flag.
+    if (token.startsWith("-") && token.length > 1 && !/^-\d/.test(token)) return { error: `不认识的选项 ${token}` };
+    rest.push(token);
+  }
+  return { flags, rest };
+}
+
+/** The words a command was given after its flags, joined back into one argument. */
+function phrase(rest) {
+  return rest.join(" ").trim();
+}
+
+//#endregion
+
+//#region the commands
+
+/**
+ * Every operation this plugin has, in one table.
+ *
+ * `write` is not decoration: it is what the help text and the tool description
+ * promise about which commands touch the disk, and it is why a person reading
+ * `memo help` can tell at a glance what is safe to run.
+ */
+export const MEMO_COMMANDS = [
+  {
+    name: "status",
+    group: "memory",
+    write: false,
+    usage: "status [--notes N]",
+    summary: "读此项目的 .memo/：STATUS 四节、最近动作、bug 数、索引状态",
+    flags: { notes: { kind: "int", hint: "N", description: "带出最近几条 journal（默认 5）" } },
+    run(ctx, args) {
+      const paths = memoPaths(ctx.project.root, ctx.state.dirName);
+      return renderStatusText(
+        ctx.project,
+        paths,
+        readStatus(paths),
+        readNotes(paths, clampInt(args.flags.notes, 1, 50, 5)),
+        loadBugs(paths),
+      );
+    },
+  },
+  {
+    name: "handoff",
+    group: "memory",
+    write: true,
+    usage: "handoff [--now T] [--next T] [--open T] [--avoid T]",
+    summary: "写 STATUS.md（只替换你传的那几节）：现在在哪 / 下一步 / 未决问题 / 不要重犯",
+    flags: {
+      now: { kind: "string", hint: "T", description: "现在在哪（替换 现在在哪 一节）" },
+      next: { kind: "string", hint: "T", description: "下一步（替换 下一步 一节）" },
+      open: { kind: "string", hint: "T", aliases: ["questions"], description: "未决问题（替换 未决问题 一节）" },
+      avoid: { kind: "string", hint: "T", aliases: ["do-not-repeat"], description: "试过不行的路（替换 不要重犯 一节）" },
+    },
+    run(ctx, args) {
+      const sections = ["now", "next", "open", "avoid"];
+      if (!sections.some((key) => typeof args.flags[key] === "string" && args.flags[key].length > 0)) {
+        return { ok: false, text: "handoff 至少要给一节：--now / --next / --open / --avoid（没传的节保持原样）" };
+      }
+      const { project, state } = ctx;
+      const paths = createMemoDir(memoPaths(project.root, state.dirName));
+      const existing = readStatus(paths);
+      const at = stamp();
+      const updated = patchStatus(
+        existing.present ? existing.text : "",
+        basename(project.root) || project.root,
+        { 现在在哪: args.flags.now, 下一步: args.flags.next, 未决问题: args.flags.open, 不要重犯: args.flags.avoid },
+        at,
+      );
+      const write = writeStatus(paths, updated);
+      if (!write.ok) return { ok: false, text: `写 ${paths.status} 失败：${write.error}` };
+      return lines(`已更新 ${paths.status}`, "", renderStatusText(project, paths, readStatus(paths), readNotes(paths, 3), loadBugs(paths)));
+    },
+  },
+  {
+    name: "note",
+    group: "memory",
+    write: true,
+    usage: "note TEXT [--kind note|decision|todo]",
+    summary: "往 journal.jsonl 追加一行：做过的决定、走过的路",
+    flags: { kind: { kind: "string", hint: "KIND", description: "条目类型：note / decision / todo（默认 note）" } },
+    run(ctx, args) {
+      const text = phrase(args.rest);
+      if (text.length === 0) return { ok: false, text: "note 需要一句话：memo note <text> [--kind decision]" };
+      const paths = createMemoDir(memoPaths(ctx.project.root, ctx.state.dirName));
+      const at = stamp();
+      const kind = args.flags.kind ?? "note";
+      const write = appendNote(paths, { at, session: ctx.session, kind, text });
+      if (!write.ok) return { ok: false, text: `写 ${paths.journal} 失败：${write.error}` };
+      const notes = readNotes(paths, 1);
+      const total = notes.present ? notes.total : 1;
+      return `已记录（journal 共 ${total} 条）：${at}  [${kind}]  ${text}`;
+    },
+  },
+  {
+    name: "scan",
+    group: "index",
+    write: true,
+    usage: "scan [--exclude DIR]",
+    summary: "重建代码索引 index.json：文件、行数、tokens、开头注释当描述、符号+行范围、import 图排名",
+    flags: { exclude: { kind: "list", hint: "DIR", description: "额外跳过的目录名，可重复；叠加在内置表之上" } },
+    async run(ctx, args) {
+      const started = Date.now();
+      const index = await buildIndex(ctx.project.root, {
+        exclude: [...ctx.state.exclude, ...(args.flags.exclude ?? [])],
+        analyzer: ctx.analyzer,
+        tokenizer: ctx.state.tokenizer,
+        log: ctx.log,
+      });
+      const paths = createMemoDir(memoPaths(ctx.project.root, ctx.state.dirName));
+      const write = writeJsonAtomic(paths.index, index);
+      if (!write.ok) return { ok: false, text: `写 ${paths.index} 失败：${write.error}` };
+      return renderScan(paths, index, staleFiles(index, 5), Date.now() - started);
+    },
+  },
+  {
+    name: "find",
+    group: "index",
+    write: false,
+    usage: "find QUERY [--budget N]",
+    summary: "按符号/路径在索引里定位到行号；回答前自动复核索引",
+    flags: {
+      file: { kind: "string", hint: "PATH", description: "改成一个具体文件：给它的描述和符号行范围" },
+      budget: { kind: "int", hint: "N", description: "短名单的 token 预算（默认 1000）" },
+    },
+    async run(ctx, args) {
+      const paths = memoPaths(ctx.project.root, ctx.state.dirName);
+      const loaded = await openIndex(paths, ctx.state, ctx.analyzer);
+      if (!loaded.ok) return { ok: false, text: `没有可用的代码索引：${loaded.error}` };
+      const file = typeof args.flags.file === "string" ? args.flags.file.trim() : "";
+      if (file.length > 0) {
+        const detail = fileDetail(loaded.index, file);
+        if (detail === null) return { ok: false, text: `索引里没有 ${file}。重新跑 memo scan，或者直接用 grep/read。` };
+        return withSync(renderFileDetail(detail), loaded.sync);
+      }
+      const query = phrase(args.rest);
+      if (query.length === 0) return { ok: false, text: "find 需要 query（符号名或路径片段），或者 --file 一个具体路径" };
+      const result = findInIndex(loaded.index, query, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1000) });
+      return withSync(renderFind(query, result, indexMeta(loaded.index)), loaded.sync);
+    },
+  },
+  {
+    name: "map",
+    group: "index",
+    write: false,
+    usage: "map [FOCUS] [--budget N]",
+    summary: "项目地图：按目录汇总，或聚焦一个主题的文件清单",
+    flags: { budget: { kind: "int", hint: "N", description: "token 预算（默认 1200）" } },
+    async run(ctx, args) {
+      const paths = memoPaths(ctx.project.root, ctx.state.dirName);
+      const loaded = await openIndex(paths, ctx.state, ctx.analyzer);
+      if (!loaded.ok) return { ok: false, text: `没有可用的代码索引：${loaded.error}` };
+      const map = buildMap(loaded.index, phrase(args.rest) || undefined, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1200) });
+      return withSync(renderMap(map), loaded.sync);
+    },
+  },
+  {
+    name: "bug-search",
+    group: "bugs",
+    write: false,
+    usage: "bug-search TERM [--limit N]",
+    summary: "按症状/报错文本检索记过的修复，重复次数参与排序",
+    flags: { limit: { kind: "int", hint: "N", description: "最多几条（默认 5）" } },
+    run(ctx, args) {
+      const term = phrase(args.rest);
+      if (term.length === 0) return { ok: false, text: "bug-search 需要一个词：memo bug-search <症状或报错文本>" };
+      const paths = memoPaths(ctx.project.root, ctx.state.dirName);
+      const bugs = loadBugs(paths);
+      if (!bugs.ok) return `这个项目还没有 bug 记忆：${bugs.error}。修完 bug 后用 memo bug-log 记第一条。`;
+      return renderBugs(term, searchBugs(bugs.bugs, term, clampInt(args.flags.limit, 1, 25, 5)));
+    },
+  },
+  {
+    name: "bug-log",
+    group: "bugs",
+    write: true,
+    usage: "bug-log --error TEXT [--cause T] [--fix T] [--file P] [--line N] [--tag T]",
+    summary: "记一条修复；同一症状再记是累加次数，不是新增一条",
+    flags: {
+      error: { kind: "string", hint: "TEXT", aliases: ["error-message", "message", "symptom"], description: "报错文本或症状，按它匹配" },
+      cause: { kind: "string", hint: "T", aliases: ["root-cause"], description: "真正的原因" },
+      fix: { kind: "string", hint: "T", description: "怎么修的" },
+      file: { kind: "string", hint: "P", description: "项目内相对路径" },
+      line: { kind: "int", hint: "N", description: "行号" },
+      tag: { kind: "list", hint: "T", aliases: ["tags"], description: "标签，可重复" },
+    },
+    run(ctx, args) {
+      const error = args.flags.error;
+      if (typeof error !== "string" || error.trim().length === 0) {
+        return { ok: false, text: "bug-log 需要症状：memo bug-log --error \"<报错文本>\" [--cause T] [--fix T]" };
+      }
+      const paths = createMemoDir(memoPaths(ctx.project.root, ctx.state.dirName));
+      const result = appendBug(paths, {
+        errorMessage: error,
+        rootCause: args.flags.cause,
+        fix: args.flags.fix,
+        file: args.flags.file,
+        line: args.flags.line,
+        tags: args.flags.tag ?? [],
+      });
+      if (!result.ok) return { ok: false, text: `写 ${paths.bugs} 失败：${result.error}` };
+      return result.updated
+        ? `已记录：${result.id}（同一症状第 ${result.occurrences} 次；共 ${result.total} 条）`
+        : `已记录：${result.id}（共 ${result.total} 条）`;
+    },
+  },
+];
+
+/** Commands in the order the help text and the switch card present them. */
+export const MEMO_COMMAND_GROUPS = [
+  { id: "memory", commands: ["status", "handoff", "note"] },
+  { id: "index", commands: ["scan", "find", "map"] },
+  { id: "bugs", commands: ["bug-search", "bug-log"] },
+];
+
+/** Every command name, in presentation order. */
+export const MEMO_COMMAND_NAMES = MEMO_COMMAND_GROUPS.flatMap((group) => group.commands);
+
+const BY_NAME = new Map(MEMO_COMMANDS.map((command) => [loose(command.name), command]));
+
+//#endregion
+
+//#region help
+
+/** One command's own page: what it does, how to spell it, what every flag means. */
+export function commandHelp(name) {
+  const command = BY_NAME.get(loose(name));
+  if (command === undefined) {
+    return { ok: false, text: `没有 ${name} 这个子命令。` + "\n\n" + usageIndex() };
+  }
+  const flags = { ...command.flags, ...ROOT_FLAG };
+  const width = Math.max(...Object.keys(flags).map((key) => key.length));
+  const out = [
+    `memo ${command.usage}`,
+    "",
+    command.summary,
+    "",
+    command.write ? "会写盘：改的是 <项目>/.memo/ 里的文件。" : "只读：不写任何文件。",
+    "",
+    "选项：",
+  ];
+  for (const [key, flag] of Object.entries(flags)) out.push(`  --${key.padEnd(width)}  ${flag.description}`);
+  return { ok: true, text: `${out.join("\n").trimEnd()}\n` };
+}
+
+/** Every command, one line each, with the ones this host has switched off marked. */
+export function usageIndex(state: Partial<MemoState> = {}) {
+  const off = new Set(MEMO_COMMANDS.filter((command) => state && state.subcommands && state.subcommands[command.name] === false).map((command) => command.name));
+  const width = Math.max(...MEMO_COMMANDS.map((command) => command.usage.length));
+  const out = ["memo <子命令> [选项] —— 一个命令行，做一件事。", ""];
+  for (const command of MEMO_COMMANDS) {
+    out.push(`  memo ${command.usage.padEnd(width)}  ${command.write ? "写" : "读"}  ${command.summary}${off.has(command.name) ? "（这个宿主上已关闭）" : ""}`);
+  }
+  out.push(
+    "",
+    "memo help <子命令>     看一个子命令的全部选项",
+    "--root PATH            指到别的项目（默认：会话工作目录）",
+    "引号                   text 里有空格就加引号，例如 memo note \"换掉了 zod\"",
+  );
+  return `${out.join("\n").trimEnd()}\n`;
+}
+
+//#endregion
+
+//#region the entry point both surfaces call
+
+/** Resolve the project a command is about: an explicit --root, the session cwd, then the host. */
+export function projectFor(env, explicitRoot) {
+  const asked = typeof explicitRoot === "string" && explicitRoot.trim().length > 0 ? explicitRoot.trim() : null;
+  const fallback = asked ?? env.cwd ?? (env.state ? env.state.defaultRoot : undefined) ?? process.cwd();
+  return findProjectRoot(resolve(fallback), env.state ? env.state.dirName : undefined);
+}
+
+/**
+ * Run one command line.
+ *
+ * @param line - the command line, without the `memo` word itself.
+ * @param env - `{ state, cwd, session, analyzer, log }`: the live plugin state, the
+ *   calling session's working directory (undefined is allowed, and falls back the
+ *   way `projectFor` documents), its session id (recorded on journal entries),
+ *   the tree-sitter analyzer or null, and a sink for scan progress.
+ * @returns `{ ok, text }` — `ok: false` is a refusal with the reason spelled
+ *   out, never a throw and never an empty answer.
+ */
+export async function runMemo(line, env) {
+  const state = env.state ?? {};
+  const split = splitCommandLine(line);
+  if (!split.ok) return { ok: false, text: `${split.error}（命令行的引号要成对）` };
+
+  const tokens = split.tokens;
+  if (tokens.length === 0) tokens.push("status");
+  const verb = tokens[0];
+
+  if (verb === "--help" || verb === "-h" || loose(verb) === "help") {
+    const about = tokens[1];
+    return about === undefined ? { ok: true, text: usageIndex(state) } : commandHelp(about);
+  }
+
+  const command = BY_NAME.get(loose(verb));
+  if (command === undefined) {
+    return { ok: false, text: `不认识的子命令 “${verb}”。` + "\n\n" + usageIndex(state) };
+  }
+  if (state.subcommands !== undefined && state.subcommands[command.name] === false) {
+    return { ok: false, text: `memo ${command.name} 在这个宿主上被关掉了（Memo 视图 → 子命令开关）。` };
+  }
+
+  const parsed = parseArgs(tokens.slice(1), command);
+  if (parsed.help === true) return commandHelp(command.name);
+  if (parsed.error !== undefined) {
+    return { ok: false, text: `memo ${command.name}: ${parsed.error}\n用法：memo ${command.usage}` };
+  }
+
+  const ctx = {
+    state,
+    session: env.session ?? null,
+    project: projectFor(env, parsed.flags.root),
+    analyzer: env.analyzer ?? null,
+    log: env.log ?? (() => {}),
+  };
+  try {
+    const result = await command.run(ctx, parsed);
+    return typeof result === "string" ? { ok: true, text: result } : result;
+  } catch (error) {
+    return { ok: false, text: `memo ${command.name} 失败：${error && error.message ? error.message : String(error)}` };
+  }
+}
+
+//#endregion
+

@@ -11,7 +11,7 @@ dsh plugin --profile web add /path/to/dsh-plugin-memo
 # 然后重启 profile —— 工具、/memo 命令、Memo 视图都在这之后才出现
 ```
 
-`link:` 安装时包内必须有 `node_modules/@deepseek-ai/dsh-tools` 软链，否则整行加载失败。
+本仓库**不提交 `node_modules/` 与 `lib/`**（都已 gitignore；`prepare` 会在 `npm install` 时自动 build 出 `lib/`）。`link:` 安装前先 `npm install`，并确保 `node_modules/@deepseek-ai/dsh-tools` 软链指向宿主的那份（peer 依赖，随宿主提供），否则整行加载失败。`tree-sitter-wasm` / `web-tree-sitter` 是 optional，装不上只是没有天窗、回退行内规则。
 
 **别把这一行再往 profile 的 `cordis.patch.yml` 里 insert 一遍。** 本包声明了 `dsh.bundle.patch`，
 `dsh plugin add` 已经把它写进 `dsh.profile.bundles`；再来一条同 id 的 patch，loader 会抛
@@ -113,10 +113,10 @@ cwd，显示 STATUS 四节、最近动作、bug 记忆、索引新鲜度，外�
 
 - **不读 `.gitignore`**：排除靠内置表（node_modules / dist / build / target / …）+ `exclude`，而且**所有点开头的目录一律跳过**。
 - **`refresh` 是同步 `statSync`**：普通项目几毫秒，20,000 文件级约 0.1 秒。嫌贵就 `refresh: false`，代价是索引只在你跑 `memo scan` 时更新。
-- **精确计数是要花钱的**：`exact` 第一次计数要读 6MB 词表（约 150ms，之后常驻内存），编码本身约 1MB/s；20,000 个文件的项目一次全量 `memo scan` 大概多花十秒。所以默认是 `estimated`，要精确就显式打开。词表在 `lib/tokenizer/deepseek_v4.tokenizer.json`，随包一起装。
-- **`tokenizer` 是换单位，不是调精度**：`estimated` 索引里的数不是精确数的舍入近似，中文上可以差一倍有余（实测本 README：约 1356 估算 vs 2581 精确，差 47%）。换单位后第一次扫描/复核会重建整份索引——复用一个旧条目，就等于把另一种单位混进了同一份 `index.json`。`memo find` 的短名单预算按索引里写明的单位扣，不会拿估算去花精确的预算。
+- **精确计数是要花钱的**：`exact` 第一次计数要读 6MB 词表（约 150ms，之后常驻内存），编码本身约 1MB/s；20,000 个文件的项目一次全量 `memo scan` 大概多花十秒。所以默认是 `estimated`，要精确就显式打开。词表在 `tokenizer/deepseek_v4.tokenizer.json`，随包一起装。
+- **`tokenizer` 是换单位，不是调精度**：`estimated` 索引里的数不是精确数的舍入近似，中文上可以差一倍有余（实测本 README：约 1754 估算 vs 3300 精确，差 47%）。换单位后第一次扫描/复核会重建整份索引——复用一个旧条目，就等于把另一种单位混进了同一份 `index.json`。`memo find` 的短名单预算按索引里写明的单位扣，不会拿估算去花精确的预算。
 - **`memo status` 和 `/memo` 不复核索引**（保持零成本、瞬时返回），报的索引状态可能比磁盘旧一点。
-- **tree-sitter 是可选的天窗**：`web-tree-sitter` + `tree-sitter-wasms`（约 50MB）覆盖 JS/TS、Python、Go、Rust，不装就只有行内规则（地板永远可用）。**Godot 的两门语言都没有现成 wasm**，插件自带两份：`lib/grammars/tree-sitter-gdscript.wasm`（290KB，tree-sitter-gdscript 6.1.0）和 `lib/grammars/tree-sitter-godot_resource.wasm`（11KB，tree-sitter-godot-resource 0.7.0），都由 `scripts/build-godot-grammars.mjs` 编译。所以 `.gd`、`.tscn`、`.tres` 也会走语法树，前提是 `web-tree-sitter` 在**且文件超过 500 tokens**（这个门槛永远按估算量算——不值得为一颗 6MB 的词表开一次 parse 来决定要不要 parse；低于门槛就按行内规则走，索引里的 `symbolSource` 会如实写 `regex`）。**解析出错的树不算升级**：文件里一旦有 ERROR 节点，整个文件保留行内规则的结果，天窗再坏也踩不塌地板。
+- **tree-sitter 是可选的天窗**：`web-tree-sitter` ^0.25 + `tree-sitter-wasm`（107 门语言的预编译 wasm，Godot 的 gdscript / godot_resource 也在内）覆盖 JS/TS、Python、Go、Rust，不装就只有行内规则（地板永远可用）。插件自己不再编译或携带 wasm：两款依赖都是 optional，缺了只是没有天窗，地板照旧。所以 `.gd`、`.tscn`、`.tres` 也会走语法树，前提是 `web-tree-sitter` 在**且文件超过 500 tokens**（这个门槛永远按估算量算——不值得为一颗 6MB 的词表开一次 parse 来决定要不要 parse；低于门槛就按行内规则走，索引里的 `symbolSource` 会如实写 `regex`）。**解析出错的树不算升级**：文件里一旦有 ERROR 节点，整个文件保留行内规则的结果，天窗再坏也踩不塌地板。
 - **面板的路由没有鉴权**：本机任何进程都能 `POST`；`/memo/config` 还能关掉子命令或拦截——只动内存，重启即恢复。
 - **Memo 视图只在带 web carrier 的 profile 里出现**：无头 profile 里那一个工具和 `/memo` 不受影响。
 - **语法是一个字符串**：命令行写错时，模型拿到的是用法说明而不是参数校验错误——`memo help` 是语法的唯一出处，改语法时记得改它（`MEMO_COMMANDS` 是那张表）。
@@ -125,17 +125,20 @@ cwd，显示 STATUS 四节、最近动作、bug 记忆、索引新鲜度，外�
 ## 开发
 
 ```sh
-npm run check            # 语法检查
-npm test                 # 102 个测试，0 skip
-npm run build:grammars   # 重新生成 lib/grammars/ 下两份 wasm（需要 docker + tar，会自检）
-node scripts/count-tokens.mjs README.md   # 用同一颗分词器数一数（--estimate 对比，--ids 出 id）
-node scripts/count-tool-tokens.mjs        # 这个插件的工具面在模型上下文里值多少 token
+npm install              # 装依赖；node_modules 不入库，tree-sitter 是 optional，缺了只降级
+npm run build            # 把 src/*.ts 编译成 lib/*.js（dsh 加载的就是 lib/）
+npm run check            # 类型检查：tsc --noEmit，覆盖 src、test、scripts
+npm test                 # 先 build，再跑 102 个测试，0 skip（Node 24 直接执行 .ts）
+node scripts/count-tokens.ts README.md   # 用同一颗分词器数一数（--estimate 对比，--ids 出 id）
+node scripts/count-tool-tokens.ts        # 这个插件的工具面在模型上下文里值多少 token
 ```
+
+源码在 `src/`（TypeScript），`dsh` 加载的是 `lib/` 下 `tsc` 的产物：`npm run build` 只写 `lib/`，`npm test` 先 build 再由 Node 24 直接执行 `test/*.test.ts`，`npm run check` 只做类型检查不落盘。`tokenizer/` 是随包的分词器词表，`src/` 与 `lib/` 都从它读；这正是它不在 `lib/` 里的原因——`lib/` 与 `node_modules/` 都不入库，整个可以删掉重来（`npm install` 会经 `prepare` 重新 build）。`tsconfig.json` 开了 `strict`，但 `noImplicitAny` 与 `strictNullChecks` 先关着：这套代码的动态边界（Cordis 上下文、JSON 索引、浏览器宿主对象）太多，先保证编译通过、测试全绿，再逐块收紧。
 
 ### 分词器
 
-`lib/tokenizer/deepseek_v4.tokenizer.json` 是导入的 DeepSeek V4 词表（byte-level BPE，128,000 词、127,741 条
-merge、1283 个 added token，连同 `tokenizer_config.json` 原样保存）。`lib/tokenizer.js` 是**不依赖任何包的纯
+`tokenizer/deepseek_v4.tokenizer.json` 是导入的 DeepSeek V4 词表（byte-level BPE，128,000 词、127,741 条
+merge、1283 个 added token，连同 `tokenizer_config.json` 原样保存）。`src/tokenizer.ts` 是**不依赖任何包的纯
 Node 编码器**：按文件里的三条 `Isolated` `Split` 规则切分（保留匹配之间的文本，不是只留匹配）、过 GPT-2 的
 byte-to-unicode 表、按 merge 排名合并。词表 6MB，所以第一次计数才解析，解析结果挂在模块上，一个进程一次。
 
@@ -146,6 +149,6 @@ token、相邻分隔符。测试逐 id 比对而不是只比长度——两个�
 ```python
 pip install tokenizers
 python3 -c "from tokenizers import Tokenizer; import json;
-tk = Tokenizer.from_file('lib/tokenizer/deepseek_v4.tokenizer.json');
+tk = Tokenizer.from_file('tokenizer/deepseek_v4.tokenizer.json');
 print(json.dumps([{'s': s, 'ids': tk.encode(s, add_special_tokens=False).ids} for s in texts], ensure_ascii=False))"
 ```
