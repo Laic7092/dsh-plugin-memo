@@ -60,6 +60,37 @@ test("a command line splits the way a person writes it", () => {
   assert.match(torn.error, /引号没闭合/);
 });
 
+test("a spelled-out newline becomes one, and other backslashes are left alone", async () => {
+  // A model spells a line break the way a JSON string does: two characters, not a
+  // real one. Read literally it does not fail, it mangles -- a handoff list lands
+  // as one line reading "- an- b". Named escapes are therefore decoded, and
+  // nothing else is: a Windows path, a regex, or a pasted phrase keeps its backslashes.
+  assert.deepEqual(splitCommandLine("handoff --open \"- a\\n- b\"").tokens, ["handoff", "--open", "- a\n- b"]);
+  assert.deepEqual(splitCommandLine("handoff --now \"x\\ty\"").tokens, ["handoff", "--now", "x\ty"]);
+  assert.deepEqual(splitCommandLine("find \"C:\\\\Users\"").tokens, ["find", "C:\\\\Users"], "a path keeps both separators");
+  // The inline spelling never went through the splitter's quoting, so it has to be
+  // read the same way where flags are parsed.
+  const inline = splitCommandLine("handoff --open=\"- a\\n- b\"").tokens;
+  assert.equal(inline[1].split("\\\\n").join(String.fromCharCode(10)), "--open=- a\n- b", "an inline value is decoded too");
+
+  const root = scratch();
+  try {
+    assert.equal((await cli(root, "handoff --open \"- 调用点默认 6 条\\n- 判不了的只计数\"")).ok, true);
+    const status = () => readFileSync(join(root, ".memo/STATUS.md"), "utf8");
+    assert.ok(status().includes("- 调用点默认 6 条\n- 判不了的只计数"), "two bullets, not one line with an n in it");
+  
+    assert.equal((await cli(root, "handoff --next=\"- 一行\\n- 两行\"")).ok, true);
+    assert.ok(status().includes("- 一行\n- 两行"), "an inline flag value is read the same way");
+    await cli(root, "note \"第一行\\n第二行\"");
+  // The journal is JSON lines, so the break is an escape there: read it back
+  // through the parser rather than looking for the character in the file.
+  const last = readFileSync(join(root, ".memo/journal.jsonl"), "utf8").trim().split(String.fromCharCode(10)).pop();
+  assert.equal(JSON.parse(last).text, "第一行\n第二行");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a bare line is the status, and handoff feeds it", async () => {
   const root = scratch();
   try {

@@ -475,12 +475,26 @@ function coerceFlag(value, flag, given) {
     if (!Number.isFinite(parsed)) return { ok: false, error: `--${given} 要一个整数，收到 ${JSON.stringify(value)}` };
     return { ok: true, value: parsed };
   }
-  return { ok: true, value: String(value) };
+  return { ok: true, value: decodeEscapes(value) };
 }
 
 /** The `--root` flag every command accepts, kept out of each command's own list. */
 const ROOT_FLAG = { root: { kind: "string", hint: "PATH", description: "项目根目录（绝对路径）。默认：会话工作目录，再往上找最近的 .memo/ 或 .git" } };
 
+/**
+ * The escape sequences a text value may spell out: \n, \t, \r.
+ *
+ * A model rarely types a real newline inside a quoted value -- it writes the
+ * two characters, because that is what a JSON string looks like. Taken
+ * literally they do not fail; they quietly mangle the text, and a handoff list
+ * typed as "- a\n- b" lands as one line reading "- an- b". So a two-character
+ * escape is read as the character it names. Nothing else is: a Windows path's
+ * backslashes, a regex, a quoted phrase someone pasted -- all of it survives,
+ * and a caller who really wants a literal backslash-n writes two backslashes.
+ */
+function decodeEscapes(value) {
+  return String(value ?? "").replace(/\\[ntr]/g, (match) => (match === "\\n" ? "\n" : match === "\\t" ? "\t" : "\r"));
+}
 /**
  * Split a command line into words, honouring quotes.
  *
@@ -492,23 +506,31 @@ const ROOT_FLAG = { root: { kind: "string", hint: "PATH", description: "项目�
 export function splitCommandLine(line) {
   const tokens = [];
   const text = String(line ?? "");
+  /** What a backslash escapes to, for the two characters it can name. */
+  const NAMED = { n: "\n", t: "\t", r: "\r" };
   let current = null;
   let quote = null;
+  const add = (ch) => { current = (current ?? "") + ch; };
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
-    if (quote !== null) {
-      if (ch === quote) { quote = null; continue; }
-      if (ch === "\\" && quote === '"' && i + 1 < text.length) { i += 1; current = (current ?? "") + text[i]; continue; }
-      current = (current ?? "") + ch;
+    if (quote !== null && ch === quote) { quote = null; continue; }
+    if (quote === null && (ch === '"' || ch === "'")) { quote = ch; current = current ?? ""; continue; }
+    if (ch === "\\" && i + 1 < text.length) {
+      const next = text[i + 1];
+      // A backslash that escapes the closing quote is punctuation and goes
+      // away; one that names a character is that character. Anything else is
+      // kept as the two characters it is -- a Windows path, a regex.
+      if (next === quote || (quote === '"' && next === '"')) { i += 1; add(next); continue; }
+      if (quote !== null && NAMED[next] !== undefined) { i += 1; add(NAMED[next]); continue; }
+      if (quote === null) { i += 1; add(next); continue; }
+      add(ch);
       continue;
     }
-    if (ch === '"' || ch === "'") { quote = ch; current = current ?? ""; continue; }
-    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+    if (quote === null && (ch === " " || ch === "\t" || ch === "\n" || ch === "\r")) {
       if (current !== null) { tokens.push(current); current = null; }
       continue;
     }
-    if (ch === "\\" && i + 1 < text.length) { i += 1; current = (current ?? "") + text[i]; continue; }
-    current = (current ?? "") + ch;
+    add(ch);
   }
   if (quote !== null) return { ok: false, error: `引号没闭合：${quote}` };
   if (current !== null) tokens.push(current);

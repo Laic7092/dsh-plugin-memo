@@ -41,7 +41,7 @@ memo bug-log    --error T [--cause|--fix|…]        写   记一条修复，同
 memo help       [子命令]                            读   语法与全部选项
 ```
 
-`--flag value` 与 `--flag=value` 等价；每个子命令都接 `--root PATH`，默认按 会话 cwd → 最近的 `.memo/` → 最近的 `.git` 找项目根。
+文本里的 \n / \t / \r 在引号内按转义解码（模型写的是 JSON 风格的两字符换行），其余反斜杠原样保留。`--flag value` 与 `--flag=value` 等价；每个子命令都接 `--root PATH`，默认按 会话 cwd → 最近的 `.memo/` → 最近的 `.git` 找项目根。
 
 ## `.memo/` 目录
 

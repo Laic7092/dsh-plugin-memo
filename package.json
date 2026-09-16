@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-memo",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Project memory for DeepSeek Harness: a committed .memo/ directory holding STATUS.md, an action journal and a bug log, exposed as model tools, a /memo human command, and a Memo view in the session.",
   "private": true,
   "type": "module",
