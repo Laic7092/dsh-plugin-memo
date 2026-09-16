@@ -30,6 +30,7 @@
 import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { INDEX_VERSION } from "./indexer.ts";
+import { padCjk } from "./tokenizer.ts";
 import { isFile } from "./store.ts";
 import type { IndexEntry, MemoIndex } from "./types.ts";
 
@@ -122,7 +123,18 @@ function schema(db) {
     // Full text over what a file *is*, not only what it declares: the body is
     // what answers "where is this string", and it is the one thing the JSON
     // index could never afford to carry.
-    "CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(path UNINDEXED, description, body)",
+    // FTS5 materializes the columns it is given, which is what the excerpt and
+    // line-number reads below use rather than keeping a second copy of the body.
+    //
+    // The pathCjk / descriptionCjk / bodyCjk columns hold the same text with every
+    // CJK character spaced out (see padCjk). FTS5 does not segment CJK, so a run
+    // of Chinese used to be one token and a phrase inside it was unsearchable: a
+    // measured project had 26 files mentioning a term the index reported absent.
+    // Splitting the characters at write time is what makes a CJK phrase searchable
+    // as the phrase it is. The body column stays exactly as the file has it -- that
+    // is where excerpts and line numbers are read from, and a padded copy would
+    // print its padding to the reader.
+    "CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(path UNINDEXED, description, body, pathCjk, descriptionCjk, bodyCjk)",
     "CREATE INDEX IF NOT EXISTS i_symbols_name ON symbols(name)",
     "CREATE INDEX IF NOT EXISTS i_symbols_file ON symbols(file_id)",
     "CREATE INDEX IF NOT EXISTS i_imports_file ON imports(file_id)",
@@ -197,6 +209,10 @@ function writeMeta(db, index) {
     tokens: index.tokens ?? "estimated",
     excludes: JSON.stringify(Array.isArray(index.excludes) ? index.excludes : []),
     symbolSource: index.symbolSource ?? "regex",
+    // What the sweep saw and did not index. Written even when it is null: an index
+    // rebuilt by a version that never counted has to stop claiming a coverage it no
+    // longer has.
+    coverage: JSON.stringify(index.coverage ?? null),
   };
   for (const [key, value] of Object.entries(values)) statement.run(key, value);
 }
@@ -238,8 +254,12 @@ function insertEntry(db, root, rel, entry, statements, bodies) {
     calls += 1;
   }
   // Unchanged files keep the body row they already have: a refresh must not
-  // re-read a megabyte of sources to record that one file moved.
-  statements.doc.run(rel, entry.description ?? "", bodies ? readBody(root, rel) : "");
+  // re-read a megabyte of sources to record that one file moved. The CJK columns
+  // are derived from exactly what is written here, so the two stay in step.
+  // The padded copies are what the full-text index searches; bodyCjk is where a
+  // CJK query matches, since FTS5 cannot segment a run of Chinese on its own.
+  const body = bodies ? readBody(root, rel) : "";
+  statements.doc.run(rel, entry.description ?? "", body, padCjk(rel), padCjk(entry.description ?? ""), padCjk(body));
   return { symbols, calls };
 }
 
@@ -249,7 +269,7 @@ function statementsFor(db) {
     symbol: db.prepare("INSERT INTO symbols(file_id, name, kind, line, end_line) VALUES (?, ?, ?, ?, ?)"),
     import: db.prepare("INSERT INTO imports(file_id, spec, target) VALUES (?, ?, NULL)"),
     call: db.prepare("INSERT INTO calls(file_id, name, receiver, receiver_type, line, caller) VALUES (?, ?, ?, ?, ?, ?)"),
-    doc: db.prepare("INSERT INTO docs(path, description, body) VALUES (?, ?, ?)"),
+    doc: db.prepare("INSERT INTO docs(path, description, body, pathCjk, descriptionCjk, bodyCjk) VALUES (?, ?, ?, ?, ?, ?)"),
     dropFile: db.prepare("DELETE FROM files WHERE path = ?"),
     dropDoc: db.prepare("DELETE FROM docs WHERE path = ?"),
   };
@@ -472,7 +492,33 @@ export function readIndexSummary(db) {
     analyzerAvailable: meta.analyzerAvailable === "1",
     analyzerGrammars: meta.analyzerGrammars ? meta.analyzerGrammars : null,
     excludes: excludesOf(meta),
+    coverage: coverageOfMeta(meta.coverage),
   };
+}
+
+/**
+ * A coverage blob a scan wrote, or null when this index predates it.
+ *
+ * Read defensively: a meta row is a string some earlier version wrote, and a
+ * status line is not worth a throw.
+ */
+function coverageOfMeta(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed === null || typeof parsed !== 'object') return null;
+    return {
+      seen: Number(parsed.seen ?? 0),
+      candidates: Number(parsed.candidates ?? 0),
+      failed: Number(parsed.failed ?? 0),
+      skipped: Number(parsed.skipped ?? 0),
+      suffixes: Array.isArray(parsed.suffixes)
+        ? parsed.suffixes.filter((entry) => Array.isArray(entry) && entry.length === 2).map((entry) => [String(entry[0]), Number(entry[1])])
+        : [],
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** Freshness as the panel reports it: which indexed files moved or vanished. */
@@ -512,9 +558,7 @@ function hasIdentifier(body, name) {
   return pattern.test(String(body ?? ""));
 }
 /**
- * One person's phrase as an FTS5 query: every word quoted, all of them required.") + "([^A-Za-z0-9_$]|$)", "i");
-  return pattern.test(String(body ?? ""));
-}
+ * One person's phrase as an FTS5 query: every word quoted, all of them required.
 /**
  * One person's phrase as an FTS5 query: every word quoted, all of them required.
  *
@@ -535,17 +579,25 @@ function ftsQuery(text) {
 
 /**
  * Files whose *text* matches a query, which is the question the symbol index
- * cannot answer. A malformed query returns an empty result rather than throwing
- * into a tool call.
+ * cannot answer. Each hit carries the line and the excerpt a reader needs, cut
+ * the same way find cuts them, and both are read from the original body rather
+ * than from the padded copy the index holds: an offset into a string the reader
+ * never sees would be a line number nobody can use.
+ *
+ * A malformed query returns an empty result rather than throwing into a tool call,
+ * and never throwing is why the per-hit body read cannot fail the query: the
+ * occurrence check gets an empty body and drops the hit instead.
  */
 export function searchText(db, query, limit = 10) {
   const text = String(query ?? "").trim();
   if (text.length === 0) return [];
-  try {
-    return db.prepare("SELECT path, snippet(docs, 2, '', '', '…', 12) AS excerpt FROM docs WHERE docs MATCH ? LIMIT ?").all(ftsQuery(text), Math.max(1, Number(limit) || 10));
-  } catch {
-    return [];
+  const out = [];
+  for (const row of queryRows(db, TEXT_QUERY, [text, ftsQuery(padCjk(text)), Math.max(1, Number(limit) || 10)])) {
+    const at = everyWordAt(bodyOf(db, row.relPath), text);
+    if (at === -1) continue;
+    out.push({ path: row.relPath, line: lineAtRow(db, row.relPath, at), excerpt: excerptAroundRow(db, row.relPath, at) });
   }
+  return out;
 }
 
 //#region the read side, answered by SQL
@@ -569,8 +621,12 @@ export function searchText(db, query, limit = 10) {
  *  - a file whose *body* matches it (20) -- the one question a symbol index can
  *    never answer, and the reason the sources are kept at all.
  *
- * Importance (the import graph's PageRank, 0..1) is added as a ten-point bonus
- * in every case, so a hub file edges out a leaf when the match is as good.
+ * That ladder is a set of tiers, and the entry with the best tier wins; inside
+ * one tier the file that says the query most often wins, and only then the
+ * standing of the file itself. Importance is that PageRank normalized against
+ * the mean -- not the 0..1 this comment used to claim -- and adding it to the
+ * ladder with a ten-point multiplier is what let a substring match in a hub
+ * outrank the exact name of a symbol in a leaf.
  *
  * @param db - an open index database.
  * @param query - one person's phrase; see {@link ftsQuery} for what is done to it.
@@ -579,39 +635,66 @@ export function searchText(db, query, limit = 10) {
  * @returns the file list ordered by score, plus the body matches with their
  *   excerpts already cut.
  */
-export function findInDb(db, query, options: { limit?: number; textLimit?: number } = {}) {
+export function findInDb(db, query, options: { limit?: number; textLimit?: number; perFile?: number; allMatches?: boolean } = {}) {
   const needle = String(query ?? "").trim();
-  if (needle.length === 0) return { query: needle, limit: 0, files: [], text: [], total: 0 };
+  if (needle.length === 0) return { query: needle, limit: 0, files: [], text: [], extra: [], total: 0 };
   const limit = Math.max(1, Math.min(500, Number(options.limit) || 60));
   const textLimit = Math.max(0, Math.min(50, options.textLimit ?? 6));
+  // How many of one file's symbols may answer, and whether the rest of them
+  // come back even where a better match already answered for that file. One answer
+  // per file is the wrong shape for a model's first question: it guessed a
+  // name, and the answer should let it read the shortlist instead of guessing again
+  // -- a catalog file can hold thirty-one constants that no single name reveals.
+  const perFile = Math.max(1, Math.min(50, Number(options.perFile) || 1));
+  const allMatches = options.allMatches === true;
   const pattern = likePattern(needle);
-  const lower = needle.toLowerCase();
+  const prefix = likePrefix(needle);
   const best = new Map();
+  // Quality first, and the standing of the file itself only inside one tier. The
+  // rows used to be ranked by ladder + importance * 10, which is the same thing
+  // until importance passes 1 -- and on a measured project it reached 4.42, so a
+  // substring match in a hub outranked the exact name of a symbol in a leaf.
+  const better = (row, current) => current === undefined
+    || row.tier > current.tier
+    || (row.tier === current.tier && Number(row.weight ?? 0) > Number(current.weight ?? 0))
+    || (row.tier === current.tier && Number(row.weight ?? 0) === Number(current.weight ?? 0) && Number(row.importance ?? 0) > Number(current.importance ?? 0));
   const keep = (row) => {
-    const current = best.get(row.relPath);
-    if (current === undefined || row.score > current.score) best.set(row.relPath, row);
+    if (better(row, best.get(row.relPath))) best.set(row.relPath, row);
   };
+  const quality = (a, b) => b.tier - a.tier
+    || Number(b.weight ?? 0) - Number(a.weight ?? 0)
+    || Number(b.importance ?? 0) - Number(a.importance ?? 0)
+    || a.relPath.localeCompare(b.relPath);
 
-  for (const row of queryRows(db, SYMBOL_QUERY, [needle, pattern, pattern, pattern, pattern, pattern, needle, pattern, pattern, pattern, limit])) {
-    // The score already came back from SQL, ladder included, so this only adds
-    // the file's own standing and says which kind of match won.
-    const named = Number(row.named ?? 0) === 1;
-    keep({
+  const named = [];
+  for (const row of rankedSymbolRows(db, needle, prefix, pattern, limit, perFile)) {
+    // The tier came back from SQL, ladder included, so this only says which kind
+    // of match won and how the file stands among the ones that matched as well.
+    const isName = Number(row.named ?? 0) === 1;
+    const tier = Number(row.tier ?? MATCH_TIER.description);
+    const entry = {
       relPath: row.relPath,
-      score: Number(row.score ?? 0) + Number(row.importance ?? 0) * 10,
-      symbol: named ? row.name : null,
-      kind: named ? row.kind : "file",
-      line: named ? Number(row.line ?? 0) : 0,
-      endLine: named ? Number(row.endLine ?? 0) : 0,
+      tier,
+      weight: 0,
+      score: tier + Number(row.importance ?? 0) * 10,
+      symbol: isName ? row.name : null,
+      kind: isName ? row.kind : "file",
+      line: isName ? Number(row.line ?? 0) : 0,
+      endLine: isName ? Number(row.endLine ?? 0) : 0,
       importance: Number(row.importance ?? 0),
       description: row.description,
-      source: named ? "symbol" : "path",
-    });
+      source: isName ? "symbol" : "path",
+    };
+    keep(entry);
+    if (isName) named.push(entry);
   }
   for (const row of queryRows(db, PATH_QUERY, [pattern, pattern, pattern, limit])) {
+    const tier = row.path ? MATCH_TIER.path : MATCH_TIER.description;
     keep({
       relPath: row.relPath,
-      score: (row.path ? 30 : 12) + Number(row.importance ?? 0) * 10,
+      tier,
+      weight: 0,
+      score: tier + Number(row.importance ?? 0) * 10,
       symbol: null,
       kind: "file",
       line: 0,
@@ -622,13 +705,19 @@ export function findInDb(db, query, options: { limit?: number; textLimit?: numbe
     });
   }
   const wantIdentifier = identifierShaped(needle);
-  for (const row of queryRows(db, TEXT_QUERY, [ftsQuery(needle), limit])) {
+  for (const row of queryRows(db, TEXT_QUERY, [needle, ftsQuery(padCjk(needle)), limit])) {
     // The phrase found the words; only the reader can tell whether they are the
     // identifier that was asked for.
     if (wantIdentifier && !hasIdentifier(bodyOf(db, row.relPath), needle)) continue;
     keep({
       relPath: row.relPath,
-      score: 20 + Number(row.importance ?? 0) * 10,
+      tier: MATCH_TIER.text,
+      // How many times the file says it. A body hit used to score the same
+      // whether the file mentions the term once or is about it -- and for a
+      // Chinese query, where the body is the only source that can answer at all,
+      // that made the whole answer a list of important files.
+      weight: Number(row.weight ?? 0),
+      score: MATCH_TIER.text + Number(row.importance ?? 0) * 10,
       symbol: null,
       kind: "text",
       line: 0,
@@ -640,27 +729,36 @@ export function findInDb(db, query, options: { limit?: number; textLimit?: numbe
     });
   }
 
-  const files = [...best.values()].sort((a, b) => b.score - a.score || a.relPath.localeCompare(b.relPath));
+  const files = [...best.values()].sort(quality);
+  // The other names of the file that answered, when they were asked for: they say
+  // what the file is about without pretending each one is the best answer.
+  const ranked = named.sort(quality);
+  const extra = allMatches ? ranked.filter((entry) => files.length > 0 && files[0].relPath === entry.relPath) : [];
   const text = [];
   if (textLimit > 0) {
-    // Only the files whose best answer *is* the body text: where a symbol
-    // already answers the query, an excerpt of the same file says it twice.
-    // Only the files whose *body* is where the query was found: a candidate
-    // that matched through the full-text index but then won on a symbol or a
-    // path has already answered, and an excerpt of it would be the same answer
-    // twice.
-    for (const file of files.filter((candidate) => candidate.text === true)) {
+    // The excerpt belongs to the entry that answered, not to a block at the end
+    // of the answer. A reader who has to walk past thirty headings to reach the
+    // one line that matched has been told where to look and not what is there --
+    // and that block was printed last, so the budget cut it first. Reading the
+    // excerpt here also gives the entry the line the query is really on: entries
+    // used to carry line 0, and every preview taken from line 1 of a GDScript
+    // file is @tool or class_name, which is what a Chinese query answer looked like.
+    for (const file of files) {
       if (text.length >= textLimit) break;
+      if (file.text !== true) continue;
       const body = bodyOf(db, file.relPath);
       if (body === null) continue;
-      const at = body.toLowerCase().indexOf(lower);
+      const at = everyWordAt(body, needle);
       if (at === -1) continue;
-      text.push({ relPath: file.relPath, line: lineAt(body, at), excerpt: excerptAround(body, at) });
+      const line = lineAt(body, at);
+      file.line = line;
+      file.endLine = line;
+      file.excerpt = excerptAround(body, at);
+      text.push({ relPath: file.relPath, line, excerpt: file.excerpt });
     }
   }
-  return { query: needle, limit, files, text, total: files.length };
+  return { query: needle, limit, files, text, extra, total: files.length };
 }
-
 /**
  * The rows behind one source.
  *
@@ -668,10 +766,25 @@ export function findInDb(db, query, options: { limit?: number; textLimit?: numbe
  * null-prototype objects, and this is what turns them into the plain objects the
  * rest of the module hands around.
  */
+/**
+ * The symbol rows, ranked inside each file so that one file can answer more than
+ * once. The window is what makes that SQL rather than a slice of a bigger result:
+ * the older shape took one row per file because the cheap query could not say which
+ * rows those were, so a model asking about a constant was told about a file.
+ *
+ * The window bound is part of the query text on purpose -- a frame cannot be a
+ * parameter -- and the caller has already clamped it to a small integer.
+ */
+function rankedSymbolRows(db, needle, prefix, pattern, limit, perFile) {
+  const sql = SYMBOL_QUERY.split(String.fromCharCode(64) + "rank").join(String(perFile));
+  return queryRows(db, sql, [needle, prefix, pattern, pattern, needle, pattern, pattern, pattern, pattern, pattern, limit]);
+}
+
 function queryRows(db, sql, params) {
   let rows;
   try {
-    rows = db.prepare(sql).all(...params);
+    const bound = Array.isArray(params) ? params : [params];
+    rows = db.prepare(sql).all(...bound);
   } catch {
     return [];
   }
@@ -685,33 +798,57 @@ function queryRows(db, sql, params) {
 }
 
 /**
+ * Match quality, as tiers instead of as one blended number.
+ *
+ * Every source used to be scored as `ladder + importance * 10`, and the ladder
+ * was documented as 0..1. It is not: importance is PageRank normalized against
+ * the mean, so an ordinary file sits near 1 and a hub well above it -- 4.42 on a
+ * measured project. That bought 44 points, more than the distance between any
+ * two rungs, and the answers showed it: a substring match in a hub outranked the
+ * exact name of a symbol in a leaf. Quality is the primary key now; the standing
+ * of the file itself only decides inside a tier.
+ */
+export const MATCH_TIER = { exact: 100, prefix: 70, contains: 45, path: 30, text: 20, description: 12 };
+
+/**
  * One row per symbol that scored, plus one per path that scored with no symbol.
  *
  * The path is carried on the symbol row so a file whose *path* matches -- but
  * which holds no matching symbol -- still answers: the name test keeps the row,
  * and `s.name` is then whatever symbol the LIMIT happened to land on, which is
  * why the caller only reads the symbol fields when the symbol itself scored.
+ *
+ * The CASE is the whole of match quality, returned as a tier rather than as a
+ * blended score, so the caller can sort on it first and let importance decide
+ * only inside a tier. The three name rungs are three different patterns -- the
+ * name, the name as a prefix, the name containing it -- because two of them used
+ * to be handed the same wildcarded pattern, which left the contains rung
+ * unreachable and scored every partial name match as if it were a prefix.
  */
 const SYMBOL_QUERY = [
-  "SELECT f.path AS relPath, f.description AS description, f.importance AS importance,",
-  "       s.name AS name, s.kind AS kind, s.line AS line, s.end_line AS endLine,",
-  // The score ladder lives here, beside the *kind* of match it came from, so a
+  // The tier ladder lives here, beside the *kind* of match it came from, so a
   // file whose path matched is never reported as if one of its symbols had.
   // Every comparison folds case: SQLite equality does not, and a caller who
   // types rankbyimportance for rankByImportance means the same symbol.
-  "       CASE",
-  "         WHEN s.name = ? COLLATE NOCASE THEN 100",
-  "         WHEN s.name LIKE ? ESCAPE '\\' THEN 70",
-  "         WHEN s.name LIKE ? ESCAPE '\\' THEN 45",
-  "         WHEN f.path LIKE ? ESCAPE '\\' THEN 30",
-  "         ELSE 12",
-  "       END AS score,",
-  "       (s.name = ? COLLATE NOCASE OR s.name LIKE ? ESCAPE '\\') AS named,",
-  "       (f.path LIKE ? ESCAPE '\\') AS path",
-  "  FROM symbols s JOIN files f ON f.id = s.file_id",
-  " WHERE s.name LIKE ? ESCAPE '\\' OR f.path LIKE ? ESCAPE '\\' OR f.description LIKE ? ESCAPE '\\'",
-  " ORDER BY score DESC, f.importance DESC, f.path, s.line",
-  " LIMIT ?",
+  // A CJK query never reaches this ladder: it is a body question, not a name one.
+"SELECT relPath, description, importance, name, kind, line, endLine, tier, named, path FROM (",
+  "SELECT f.path AS relPath, f.description AS description, f.importance AS importance,",
+"       s.name AS name, s.kind AS kind, s.line AS line, s.end_line AS endLine,",
+"       CASE",
+"         WHEN s.name = ? COLLATE NOCASE THEN " + MATCH_TIER.exact,
+"         WHEN s.name LIKE ? ESCAPE '\\' THEN " + MATCH_TIER.prefix,
+"         WHEN s.name LIKE ? ESCAPE '\\' THEN " + MATCH_TIER.contains,
+"         WHEN f.path LIKE ? ESCAPE '\\' THEN " + MATCH_TIER.path,
+"         ELSE " + MATCH_TIER.description,
+"       END AS tier,",
+"       (s.name = ? COLLATE NOCASE OR s.name LIKE ? ESCAPE '\\') AS named,",
+"       (f.path LIKE ? ESCAPE '\\') AS path,",
+"       ROW_NUMBER() OVER (PARTITION BY f.id ORDER BY f.importance DESC, s.line) AS perFileRank",
+"  FROM symbols s JOIN files f ON f.id = s.file_id",
+" WHERE s.name LIKE ? ESCAPE '\\' OR f.path LIKE ? ESCAPE '\\' OR f.description LIKE ? ESCAPE '\\'",
+") WHERE perFileRank <= @rank",
+" ORDER BY tier DESC, importance DESC, relPath, line",
+" LIMIT ?",
 ].join(String.fromCharCode(10));
 
 /** Path and description hits: the file-level answers, with no symbol involved. */
@@ -729,17 +866,42 @@ const PATH_QUERY = [
  * Which files match is FTS5's business -- it tokenizes, and it is fast -- but
  * the *excerpt* is not: a snippet window counts tokens, not lines, and what a
  * reader of a code index needs is the line number and the lines around it. So
- * this query only decides which files matched; where and what is read back from
- * the body.
+ * this query only decides which files matched and how often the body says the
+ * query; where it says it, and what it looks like, is read back from the body.
+ *
+ * The weight is a count of occurrences, not a rank. FTS5 has bm25, but it is
+ * normalized by document length and idf, and with the CJK columns padded to one
+ * token per character it put a file mentioning a term twice above the file that
+ * mentions it sixteen times. Counting costs one pass over the matching bodies --
+ * measured at 2.5 ms for a thousand of them -- and it orders the answer the way a
+ * reader would.
  */
 const TEXT_QUERY = [
-  "SELECT d.path AS relPath, f.description AS description, f.importance AS importance",
+  "SELECT d.path AS relPath, f.description AS description, f.importance AS importance,",
+  "       (length(d.body) - length(replace(lower(d.body), lower(?), ''))) AS weight",
   "  FROM docs d JOIN files f ON f.path = d.path",
-  " WHERE docs MATCH ?",
+  " WHERE bodyCjk MATCH ?",
   " GROUP BY d.path",
-  " ORDER BY importance DESC, relPath",
+  " ORDER BY weight DESC, importance DESC, d.path",
   " LIMIT ?",
 ].join(String.fromCharCode(10));
+
+/**
+ * The first position where every whitespace-separated word of the query appears
+ * in the body, or -1 when one of them does not. The index answers with an AND over
+ * the words; showing the hit means showing text a reader can recognize, so the
+ * position is taken from the body itself.
+ */
+function everyWordAt(body, query) {
+  if (body === null) return -1;
+  const haystack = String(body).toLowerCase();
+  const words = String(query ?? "").split(/\s+/).filter((word) => word.length > 0).map((word) => word.toLowerCase());
+  if (words.length === 0) return -1;
+  const at = haystack.indexOf(words[0]);
+  if (at === -1) return -1;
+  for (const word of words) if (haystack.indexOf(word) === -1) return -1;
+  return at;
+}
 
 /** A file's stored body, or null when it has none. */
 function bodyOf(db, relPath) {
@@ -751,6 +913,16 @@ function bodyOf(db, relPath) {
   }
   const body = row === null || row === undefined ? null : row.body;
   return typeof body === "string" && body.length > 0 ? body : null;
+}
+
+/** The line a byte offset falls on, read back from the file's own body. */
+function lineAtRow(db, relPath, offset) {
+  return lineAt(bodyOf(db, relPath) ?? "", offset);
+}
+
+/** The excerpt around an offset, read back from the file's own body. */
+function excerptAroundRow(db, relPath, offset) {
+  return excerptAround(bodyOf(db, relPath) ?? "", offset);
 }
 
 /** The 1-based line an offset falls on, counted without splitting the body. */
@@ -784,6 +956,18 @@ function excerptAround(body, offset, margin = EXCERPT_MARGIN) {
   const out = [];
   for (let i = first; i <= last; i++) out.push(String(i + 1) + ": " + lines[i].trimEnd());
   return out;
+}
+
+/**
+ * A query as a prefix pattern: what a name *starts* with.
+ *
+ * The ladder has three name rungs -- the name itself, a name that starts with the
+ * query, a name that contains it -- and this is the difference between the last
+ * two. Both LIKE rungs used to be handed the same wildcarded pattern, which left
+ * the contains rung unreachable and scored every partial name match as a prefix.
+ */
+export function likePrefix(text) {
+  return String(text).replace(/[\%_]/g, "\$&") + "%";
 }
 
 /**

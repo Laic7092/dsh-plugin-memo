@@ -312,3 +312,49 @@ export function countTokens(text: string, options: { path?: string } = {}) {
   }
   return count;
 }
+
+/**
+ * How far the CJK runs an FTS5 tokenizer cannot search reach.
+ *
+ * The escapes are spelled out rather than written as literal characters: this
+ * file is read by people, and a range like \u3040-\u30ff is a fact about
+ * Unicode, not a keystroke. They are the ranges source code actually carries --
+ * ideographs (and the extensions newer emoji-era text uses), the two kana
+ * scripts, compatibility ideographs, and Hangul.
+ */
+const CJK = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+const CJK_RUN = new RegExp("[" + CJK.source.slice(1, -1) + "]+", "g");
+
+/**
+ * Text with every CJK character spaced out, for the full-text index.
+ *
+ * The FTS5 tokenizer this index uses (`unicode61`) does not segment CJK: a run
+ * like 日结处理 is *one* token, so a search for a two-character phrase out of
+ * the middle of it finds nothing, and the answer reads as "the project does not
+ * mention this" rather than "the index cannot say". That is the one failure a
+ * search surface must not have, and it was measured on a real GDScript project:
+ * 日结 lived in 26 files, was indexed in all of them, and matched none.
+ *
+ * So the CJK runs are pre-tokenized on both sides of the index -- this function
+ * runs over the body, the path and the description when a scan writes them, and
+ * over the query when one is searched. A phrase becomes the consecutive run of
+ * one-character tokens that a phrase query already means, which is what makes
+ * 日结 a phrase *inside* 日结处理; a single character is a token and an answer.
+ *
+ * ASCII is deliberately left exactly as it was: `migrate_save` still tokenizes
+ * into the parts the identifier rule expects, `ZEBRA-CROSSING` still keeps its
+ * hyphens, and nothing about an English query moves. It costs index size where
+ * there is CJK to pay for -- that is the trade, and it buys the hits.
+ *
+ * @param text - a body, a path, or one query.
+ * @returns the same text with spaces between CJK characters; no other change.
+ */
+export function padCjk(text: string): string {
+  const source = String(text ?? "");
+  if (source.length === 0) return source;
+  // One space around every CJK run, so the run becomes one token per
+  // character; the collapse and the trim take back the spaces that fall
+  // next to whitespace the file already had.
+  const spaced = source.replace(CJK_RUN, (run) => " " + [...run].join(" ") + " ");
+  return spaced.replace(/\s+/g, " ").trim();
+}

@@ -56,6 +56,27 @@ export interface IndexEntry {
   className: string | null;
 }
 
+/**
+ * What a sweep saw and did not index.
+ *
+ * The extension table is the whole of what this index can see, so what it left
+ * out is part of what a query means. Without it a miss reads as absence -- the
+ * one thing a search surface must never say -- and the suffixes are the part a
+ * reader can act on: a `.md`, a `.cfg`, a `.csv` is a place to look next.
+ */
+export interface IndexCoverage {
+  /** Files the sweep visited, after excludes and the project's own ignore names. */
+  seen: number;
+  /** How many of those the extension table accepted as candidates. */
+  candidates: number;
+  /** Candidates that could not be indexed at all: binary, over the cap, unreadable. */
+  failed: number;
+  /** Every file outside the table, including the ones the suffix list leaves out. */
+  skipped: number;
+  /** Outside the table, by suffix, biggest first, capped at COVERAGE_SUFFIXES. */
+  suffixes: Array<[string, number]>;
+}
+
 /** The whole on-disk index. */
 export interface MemoIndex {
   version: number;
@@ -69,6 +90,11 @@ export interface MemoIndex {
   fileCount: number;
   totalTokens: number;
   symbolSource: string;
+  /**
+   * What the sweep left out. Optional because an index written before this had
+   * no way to know, and a missing answer is not the same as "nothing was left out".
+   */
+  coverage?: IndexCoverage | null;
   files: Record<string, IndexEntry>;
 }
 

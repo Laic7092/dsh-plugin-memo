@@ -45,7 +45,7 @@ const NOTE_CHARS = 200;
 const DECISION_CHARS = 400;
 import { patchStatus, readStatus, sectionBody, STATUS_SECTIONS, writeStatus } from "./status.ts";
 import { clampInt, createMemoDir, findProjectRoot, isFile, memoPaths, stamp, statOrNull } from "./store.ts";
-import { closeDb, findInDb, indexDbStat, openIndexDb, readIndex, syncIndex, writeIndex } from "./db.ts";
+import { closeDb, findInDb, indexDbPath, indexDbStat, openIndexDb, readIndex, readIndexSummary, syncIndex, writeIndex } from "./db.ts";
 import type { MemoIndex, MemoState } from "./types.ts";
 
 const fmt = (n) => Number(n ?? 0).toLocaleString("en-US");
@@ -65,6 +65,7 @@ const FIND_CANDIDATES = 60;
 const FIND_TEXT = 5;
 /** How many callers the first symbol hit lists, and how they are grouped. */
 const FIND_CALLERS = 6;
+const FIND_PER_FILE = 3;
 /** The reasons a call site was attributed, in the order the answer shows them. */
 const VIA_ORDER = ["self", "type", "only", "import"];
 const VIA_LABEL = { self: "本文件", type: "按类型", only: "全项目唯一", import: "按 import" };
@@ -85,8 +86,59 @@ function tokenAmount(count, unit) {
 
 //#region rendering — the text both callers read
 
+/**
+ * What the index can see and what it left outside, as one line.
+ *
+ * `memo find` answering nothing is not the project not having the thing, and the
+ * difference is exactly the files the extension table never accepted. The count
+ * says how big that blind spot is; the suffixes say where to look instead -- a
+ * `.md`, a `.cfg`, a `.csv` or a `.sh` is something a reader can act on, and a
+ * model that knows they are outside the index reaches for grep instead of
+ * concluding that the project has nothing to say.
+ *
+ * The biggest lists are import sidecars -- .html, .uid, .import, .ctex -- so the
+ * line names the eight biggest and folds the tail into one number: a footer
+ * nobody reads is a footer that does not exist.
+ */
+function coverageLine(coverage, indexed) {
+  if (coverage === null || coverage === undefined || Number(coverage.seen ?? 0) <= 0) return "";
+  const failed = Number(coverage.failed ?? 0) > 0
+    ? "；" + fmt(coverage.failed) + " 个候选读不出来（二进制、超限或不可读）"
+    : "";
+  const skipped = Number(coverage.skipped ?? 0);
+  if (skipped <= 0) return "索引覆盖：扫过的 " + fmt(coverage.seen) + " 个文件都在索引里" + failed;
+  const top = (coverage.suffixes ?? []).slice(0, 8);
+  const named = top.map((entry) => entry[0] + " " + fmt(entry[1])).join(" · ");
+  const rest = skipped - top.reduce((sum, entry) => sum + Number(entry[1] ?? 0), 0);
+  return "索引盲区：已索引 " + fmt(indexed) + "/" + fmt(coverage.seen) + " 个文件 · 未索引 " + fmt(skipped)
+    + " 个（" + named + (rest > 0 ? " · 其余 " + fmt(rest) : "") + "）" + failed;
+}
+
+/**
+ * The index's own account of what it left out, for `status`.
+ *
+ * Read from the database a scan already wrote rather than from a walk of its own:
+ * status must not cost a directory sweep, and a number recomputed now would
+ * describe a different tree than the index describes. Missing, unreadable, or
+ * written by a version that never counted -- all of them answer "", and cost the
+ * line rather than the command.
+ */
+async function indexCoverageLine(paths) {
+  if (!isFile(indexDbPath(paths))) return "";
+  const opened = await openIndexDb(paths);
+  if (!opened.ok) return "";
+  try {
+    const summary = readIndexSummary(opened.db);
+    return coverageLine(summary.coverage, summary.fileCount);
+  } catch {
+    return "";
+  } finally {
+    closeDb(opened.db);
+  }
+}
+
 /** STATUS.md as a reader takes it: the four sections, labelled and attributed. */
-function renderStatusText(project, paths, status, notes, bugs) {
+function renderStatusText(project, paths, status, notes, bugs, coverage = null) {
   const out = [`memo · ${project.root}`];
   const dirName = basename(paths.dir);
   out.push(status.present
@@ -112,6 +164,9 @@ function renderStatusText(project, paths, status, notes, bugs) {
   out.push(indexStat === null
     ? "代码索引：还没建（memo scan 会建）"
     : `代码索引：${fmt(indexStat.bytes)} 字节，改于 ${new Date(indexStat.mtimeMs).toISOString()}`);
+  // What the index cannot see, on the page a session reads first: a miss from
+  // find is a fact about the index, and this is the only place that says which.
+  if (coverage) out.push(coverage);
 
   out.push("", notes.present ? `最近动作（${notes.notes.length}/${notes.total} 条）` : "最近动作：还没有");
   for (const note of notes.notes) out.push(`  ${note.at}  [${note.kind}]  ${note.text}`);
@@ -132,9 +187,9 @@ function renderBugs(term, found) {
   return `${out.join("\n").trimEnd()}\n`;
 }
 
-function renderFileDetail(detail) {
+function renderFileDetail(detail, scannedAt = null) {
   const out = [
-    `${detail.relPath}  ${detail.lines} 行 · 约 ${fmt(detail.tokens)} tokens · importance ${Number(detail.importance ?? 0).toFixed(2)}`,
+    `${detail.relPath}  ${detail.lines} 行 · 约 ${fmt(detail.tokens)} tokens · importance ${Number(detail.importance ?? 0).toFixed(2)}${scannedAt === null || scannedAt === undefined || scannedAt === '' ? '' : ' · 索引建于 ' + scannedAt}`,
   ];
   if (detail.description) out.push(detail.description);
   out.push("");
@@ -157,18 +212,36 @@ function renderFileDetail(detail) {
  * body; a best answer with no body (a path hit) leaves the budget to the first
  * hit that has one.
  */
-function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number; callers?: number; full?: boolean; index?: MemoIndex | null } = {}) {
+function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number; callers?: number; perFile?: number; full?: boolean; index?: MemoIndex | null; scannedAt?: string | null } = {}) {
   const budget = Number.isFinite(options.budgetTokens) ? options.budgetTokens : FIND_BUDGET;
   const bodies = clampInt(options.bodies, 0, 8, 1);
   const callers = clampInt(options.callers, 0, 50, FIND_CALLERS);
+  // How many of one file own names may answer, and how much plain text a hit gets
+  // while the budget has room. One answer per file is the shape that made a model
+  // guess ten times for names the index already held -- a catalog file can carry
+  // thirty-one constants, and no single one of them reveals the rest.
+  const perFile = clampInt(options.perFile, 1, 50, 1);
   // `--full` is the only thing that lifts the per-body line cap; the count is the
   // count of bodies. Both spend the same budget, which is what makes the number
   // in the footer true.
   const bodyLines = options.full === true ? Number.MAX_SAFE_INTEGER : FIND_BODY_LINES;
-  let moreBodies = false;
   const index = options.index ?? null;
+  // When the index was built, said in the footer of every answer: a hit list that
+  // looks fresh off an index nobody dated invites the conclusion this tool exists
+  // to prevent -- that a miss means the project does not have the thing.
+  const scannedAt = options.scannedAt ?? null;
   if (result.files.length === 0 && result.text.length === 0) {
-    return `索引里没有匹配 "${query}" 的符号、路径或正文（索引共 ${fmt(meta.fileCount)} 个文件，${fmt(meta.symbolCount)} 个符号）。`;
+    // What this answer does not know, said before what it did find. A miss used to
+    // read as if the project had no such thing, and that is the one reading a
+    // search surface must never invite: the index is a sample of what is
+    // searchable, not a proof of absence. A measured project had 26 files
+    // mentioning a term that the index reported as absent, so the sentence says so.
+    const lines = [
+      `索引里没有匹配 ${JSON.stringify(query)}`,
+      `索引共 ${fmt(meta.fileCount)} 个文件、${fmt(meta.symbolCount)} 个符号，正文按词和字建索引——它漏掉的词，不等于项目里没有。`,
+      `要确证「没有」用 grep -rn；要读某个文件用 memo find --file <路径>。`,
+    ];
+    return lines.join(String.fromCharCode(10)) + String.fromCharCode(10);
   }
   const unit = meta.tokens === "exact" ? "exact" : "estimated";
   const counter = costUnit(unit);
@@ -177,14 +250,22 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
   const chromeReserve = 40;
   let spent = chromeReserve;
   let shown = 0;
+  let bodiesShown = 0;
+  let excerpts = 0;
   let truncated = false;
+  let moreBodies = false;
   const out = [];
   for (const file of result.files) {
-    const heading = [
-      file.symbol ? `${file.relPath}:${file.line}-${file.endLine}` : file.relPath,
-      file.kind + (file.symbol ? " " + file.symbol : ""),
-      `[${Number(file.importance ?? 0).toFixed(2)}]`,
-    ].join("  ");
+    // A body hit's heading carries the line the query is on, which is the one
+    // thing a reader needs and the one thing this list never had: entries used to
+    // report line 0, so every preview came from line 1 -- and line 1 of a GDScript
+    // file is @tool, class_name or extends, which is what a Chinese answer used to
+    // look like from top to bottom.
+    const where = file.symbol
+      ? `${file.relPath}:${file.line}-${file.endLine}`
+      : (file.text === true && Number(file.line) > 0 ? `${file.relPath}:${file.line}` : file.relPath);
+    const what = file.symbol ? file.kind + " " + file.symbol : (file.text === true ? "正文命中" : file.kind);
+    const heading = [where, what, `[${Number(file.importance ?? 0).toFixed(2)}]`].join("  ");
     const cost = counter(heading) + 2;
     if (spent + cost > budget && shown > 0) {
       truncated = true;
@@ -193,7 +274,11 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
     spent += cost;
     shown += 1;
     out.push(heading);
-    if (file.description) out.push("    " + file.description);
+    if (file.description) {
+      const description = "    " + file.description;
+      spent += counter(description) + 1;
+      out.push(description);
+    }
     // Who calls it, and before the body on purpose: whether the body needs
     // reading at all depends on who is already calling it. This is the question
     // a symbol index could not answer, and the calls table exists for it.
@@ -228,8 +313,41 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
         if (notes.length > 0) out.push("    " + notes.join("；"));
       }
     }
-    // The body, for the first hit that has one and no more unless asked.
-    if (shown > bodies || !file.symbol) continue;
+    // The other names of the file that answered, when they were asked for. They
+    // are the shortlist the first answer implies, and printing them here costs one
+    // line each instead of a query each.
+    if (file.symbol && perFile > 1 && Array.isArray(result.extra)) {
+      const others = result.extra.filter((entry) => entry.relPath === file.relPath && entry.symbol !== null && entry.symbol !== file.symbol).slice(0, perFile - 1);
+      for (const other of others) {
+        const line = "    " + other.line + "-" + other.endLine + "  " + other.symbol;
+        const lineCost = counter(line) + 1;
+        if (spent + lineCost > budget) { truncated = true; break; }
+        spent += lineCost;
+        out.push(line);
+      }
+    }
+    // The text behind a body hit, printed where that hit is. It used to be a
+    // block after the whole shortlist, which is the worst possible place for the
+    // one part of the answer worth reading: the budget had been spent on headings
+    // by the time anything reached it, so it was also the first thing truncated
+    // away -- nine headings of line-one noise, and not one line of the answer.
+    if (file.text === true && Array.isArray(file.excerpt) && file.excerpt.length > 0 && bodies > 0) {
+      const text = file.excerpt.map((line) => "    " + line).join(String.fromCharCode(10));
+      const excerptCost = counter(text) + 1;
+      if (spent + excerptCost <= budget) {
+        spent += excerptCost;
+        out.push(text);
+        excerpts += 1;
+      } else {
+        truncated = true;
+      }
+      continue;
+    }
+    // The body, for the first hits that have one and no more unless asked. No
+    // preview alongside it: the preview window was the symbol's own range, so the
+    // body repeated every line the preview had already printed -- 33 lines twice,
+    // and half of a 1,109-token answer spent on the duplicate.
+    if (!file.symbol || shown > bodies) continue;
     const body = symbolBody(db, file.relPath, file.line, file.endLine, bodyLines);
     if (body === null) continue;
     const bodyCost = counter(body.text) + 2;
@@ -238,51 +356,35 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
       continue;
     }
     spent += bodyCost;
-    // The range is already in the heading above; the body speaks for itself.
+    bodiesShown += 1;
     out.push(body.text);
-    // Both tails are measured like everything else: they are part of the answer a
-    // reader pays for, and one that does not fit is said in the footer instead.
     const bodyMore = body.more > 0 ? `    ... 还有 ${body.more} 行，用 --full 或 --file ${file.relPath}` : "";
     if (bodyMore.length > 0 && spent + counter(bodyMore) + 1 <= budget) { spent += counter(bodyMore) + 1; out.push(bodyMore); }
     else if (body.more > 0) truncated = true;
   }
-  if (bodies > 0 && shown > bodies && result.files.slice(bodies).some((file) => file.symbol)) moreBodies = true;
-  // Body excerpts answer the same question as a body does, so they spend the
-  // same budget and obey the same count. This used to be bolted on after the
-  // budget was settled, which is how a 100-token answer arrived at 1561
-  // characters.
-  for (const hit of result.text) {
-    if (bodies <= 0) break;
-    const headLine = `${hit.relPath}:${hit.line}  正文命中`;
-    const cost = counter(headLine) + hit.excerpt.reduce((sum, line) => sum + counter(line), 0) + 2;
-    if (spent + cost > budget && shown > 0) { truncated = true; break; }
-    spent += cost;
-    out.push(headLine);
-    for (const excerpt of hit.excerpt) out.push("    " + excerpt);
-  }
-  // Everything a reader pays for is measured, this line included: the number in
-  // it used to be the sum of the headings and bodies, so a 100-token answer
-  // reported 84 and arrived at 121.
-  // Everything a reader pays for is measured, this line included. The number it
-  // reports is the real cost of the answer -- headings, bodies, excerpts and the
-  // two lines of chrome -- because a budget that under-reports itself is not a
-  // budget: a 100-token answer used to say 84 and arrive at 119.
+  // More bodies exist when symbol hits outnumber the ones actually expanded; a
+  // truncated answer already says so and does not need to say it twice.
+  const symbolHits = result.files.filter((file) => file.symbol).length;
+  moreBodies = !truncated && symbolHits > bodiesShown && bodiesShown > 0;
+  // Everything a reader pays for is measured, this line included: the number it
+  // reports is the real cost of the answer, and when the index was built is part
+  // of what the answer is worth -- a fresh-looking hit list off a stale index
+  // invites exactly the conclusion this tool must not invite.
+  const textHits = result.files.filter((file) => file.text === true).length;
   const head = [
     `${fmt(result.total)} 个文件命中 · 列出 ${fmt(shown)} 个`,
-    result.text.length > 0 ? `${result.text.length} 处正文命中` : "",
+    // How many body hits there are, not how many were expanded: the count is a
+    // fact about the query, and the expansion is what the budget bought.
+    textHits > 0 ? `${fmt(textHits)} 处正文命中` + (excerpts > 0 && excerpts < textHits ? `（展开 ${fmt(excerpts)} 处）` : "") : "",
     truncated ? "被预算截断，--budget 可加" : "",
-    !truncated && moreBodies ? "还有命中有正文，--bodies 可加" : "",
+    moreBodies ? "还有命中没展开正文，--bodies 可加" : "",
   ].filter((part) => part.length > 0).join(" · ");
-  // What the reader actually gets, counted rather than estimated: the reserve came
-  // off, the chrome goes on, and the number in the line is the cost of the line
-  // that carries it.
   const content = Math.max(0, spent - chromeReserve);
   const reported = content + counter(head) + counter(`${tokenAmount(content, unit)}/${fmt(budget)}`);
-  const totalLine = `共 ${tokenAmount(reported, unit)}/${fmt(budget)}${reported > budget ? "（超：第一条命中无法再切）" : ""}`;
+  const totalLine = `共 ${tokenAmount(reported, unit)}/${fmt(budget)}${reported > budget ? '（超：第一条命中无法再切）' : ''}${scannedAt === undefined || scannedAt === null || scannedAt === '' ? '' : ' · 索引建于 ' + scannedAt}`;
   const headFull = head + " · " + totalLine;
   const body = [headFull, "", ...out].join(String.fromCharCode(10)).trimEnd();
   return `${body}${String.fromCharCode(10)}`;
-
 }
 
 /**
@@ -325,26 +427,27 @@ function readFileLines(db, relPath, from, to) {
   return body.split(String.fromCharCode(10)).slice(from - 1, to);
 }
 
-function renderMap(map) {
+function renderMap(map, scannedAt = null) {
+  const built = scannedAt === null || scannedAt === undefined || scannedAt === "" ? "" : ` · 索引建于 ${scannedAt}`;
   if (map.mode === "rollup") {
     if (map.dirs.length === 0) return "索引里还没有文件——先跑 memo scan。";
-    const out = [`项目地图（按目录）· ${tokenAmount(map.spent, map.tokens)}/${fmt(map.budget)} tokens`, ""];
+    const out = [`项目地图（按目录）· ${tokenAmount(map.spent, map.tokens)}/${fmt(map.budget)} tokens${built}`, ""];
     for (const bucket of map.dirs) {
       out.push(`${bucket.dir}/  ${bucket.files} 个文件 · ${tokenAmount(bucket.tokens, map.tokens)} · 代表：${bucket.best ? bucket.best.relPath : "-"}`);
     }
     if (map.truncated) out.push("", `（另有 ${map.total - map.dirs.length} 个目录未列出）`);
-    return `${out.join("\n").trimEnd()}\n`;
+    return `${out.join(String.fromCharCode(10)).trimEnd()}${String.fromCharCode(10)}`;
   }
-  if (map.files.length === 0) return `没有匹配 "${map.focus}" 的文件。`;
+  if (map.files.length === 0) return `没有匹配 ${JSON.stringify(map.focus)} 的文件。要按文件路径看符号表，用 memo map <路径>（或 memo find --file <路径>）。`;
   const out = [
-    `聚焦地图 "${map.focus}" · ${map.files.length}/${fmt(map.total)} 个文件 · ${tokenAmount(map.spent, map.tokens)}/${fmt(map.budget)} tokens${map.truncated ? "（被预算截断）" : ""}`,
+    `聚焦地图 ${JSON.stringify(map.focus)} · ${map.files.length}/${fmt(map.total)} 个文件 · ${tokenAmount(map.spent, map.tokens)}/${fmt(map.budget)} tokens${map.truncated ? "（被预算截断）" : ""}${built}`,
     "",
   ];
   for (const file of map.files) {
     out.push(`${file.relPath}  [${Number(file.importance ?? 0).toFixed(2)}]  ${file.symbols} 符号 · ${tokenAmount(file.tokens, map.tokens)}`);
-    if (file.description) out.push(`    ${file.description}`);
+    if (file.description) out.push("    " + file.description);
   }
-  return `${out.join("\n").trimEnd()}\n`;
+  return `${out.join(String.fromCharCode(10)).trimEnd()}${String.fromCharCode(10)}`;
 }
 
 function renderScan(paths, index: MemoIndex, stale, durationMs, written = null) {
@@ -370,6 +473,10 @@ function renderScan(paths, index: MemoIndex, stale, durationMs, written = null) 
   } else {
     out.push("索引与磁盘一致。");
   }
+  // What the sweep left out, said where a reader can still act on it: an
+  // exclusion is a one-line answer to a suffix that does not belong in the index.
+  const blind = coverageLine(index.coverage ?? null, meta.fileCount);
+  if (blind.length > 0) out.push(blind);
   const top = Object.entries(index.files)
     .sort((a, b) => b[1].importance - a[1].importance)
     .slice(0, 5);
@@ -503,14 +610,18 @@ async function runFind(session, args) {
   const query = phrase(args.rest);
   if (query.length === 0) return { ok: false, text: "find 需要 query（符号名、路径片段，或正文里的任意词），或者 --file 一个具体路径" };
   const full = args.flags.full === true;
-  const result = findInDb(session.db, query, { limit: FIND_CANDIDATES, textLimit: FIND_TEXT });
+  // Flags are stored under the key the spec declares, so a hyphenated option is
+  // read with a hyphen too.
+  const asked = args.flags['per-file'];
+  const perFile = asked === undefined ? 1 : clampInt(asked, 1, 50, FIND_PER_FILE);
+  const result = findInDb(session.db, query, { limit: FIND_CANDIDATES, textLimit: FIND_TEXT, perFile, allMatches: perFile > 1 });
   const meta = indexMeta(session.index);
   const budget = clampInt(args.flags.budget, 100, 20000, FIND_BUDGET);
   // The count is the count; `--full` only lifts the per-body line cap, so
   // `--bodies 2 --full` means two whole bodies rather than sixteen halves.
   const bodies = args.flags.bodies === undefined ? 1 : clampInt(args.flags.bodies, 0, 8, 1);
   const callers = args.flags.callers === undefined ? FIND_CALLERS : clampInt(args.flags.callers, 0, 50, FIND_CALLERS);
-  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies, callers, full, index: session.index }) };
+  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies, callers, perFile, full, index: session.index, scannedAt: meta.scannedAt }) };
 }
 
 //#endregion
@@ -654,9 +765,9 @@ export const MEMO_COMMANDS = [
     group: "memory",
     write: false,
     usage: "status [--notes N]",
-    summary: "读此项目的 .memo/：STATUS 四节、最近动作、bug 数、索引状态",
+    summary: "读此项目的 .memo/：STATUS 四节、最近动作、bug 数、索引状态与盲区",
     flags: { notes: { kind: "int", hint: "N", description: "带出最近几条 journal（默认 5）" } },
-    run(ctx, args) {
+    async run(ctx, args) {
       const paths = memoPaths(ctx.project.root, ctx.state.dirName);
       return renderStatusText(
         ctx.project,
@@ -664,6 +775,7 @@ export const MEMO_COMMANDS = [
         readStatus(paths),
         readNotes(paths, clampInt(args.flags.notes, 1, 50, 5)),
         loadBugs(paths),
+        await indexCoverageLine(paths),
       );
     },
   },
@@ -768,14 +880,15 @@ export const MEMO_COMMANDS = [
     name: "find",
     group: "index",
     write: false,
-    usage: "find QUERY [--file PATH] [--budget N] [--bodies N] [--callers N] [--full]",
-    summary: "在索引里定位符号/路径/正文：给行号，首个命中给正文和调用点；回答前自动复核索引",
+    usage: "find QUERY [--file PATH] [--budget N] [--bodies N] [--callers N] [--per-file N] [--full]",
+    summary: "在索引里定位符号/路径/正文：每条命中给行号，前几条直接给正文或命中行摘录，首个符号给调用点；回答前自动复核索引，并说明索引建立时间",
     flags: {
       file: { kind: "string", hint: "PATH", description: "改成一个具体文件：给它的描述和符号行范围" },
       budget: { kind: "int", hint: "N", description: "整个答案的 token 预算（默认 2000）：清单、正文、调用点、正文摘录都算在里面" },
-      bodies: { kind: "int", hint: "N", description: "展开几段正文（默认 1；0 = 不要正文，也不要正文摘录，只要行号）" },
+      bodies: { kind: "int", hint: "N", description: "展开几段正文（默认 1；0 = 不要正文摘录，只给行号）：符号命中给整段，正文命中给命中行前后几行" },
       full: { kind: "bool", description: "正文不截断（默认每段 80 行；段数仍由 --bodies 决定，总量仍受 --budget 限制）" },
       callers: { kind: "int", hint: "N", description: "首个命中的符号列几个调用点（默认 6；0 = 不列）" },
+      "per-file": { kind: "int", hint: "N", description: "每个文件最多列几个符号（默认 1；想知道一个文件里还有什么名字时用 10）" },
     },
     async run(ctx, args) {
       const paths = memoPaths(ctx.project.root, ctx.state.dirName);
@@ -803,8 +916,16 @@ export const MEMO_COMMANDS = [
       const session = await openIndexSession(paths, ctx.state, ctx.analyzer);
       if (!session.ok) return { ok: false, text: `没有可用的代码索引：${session.error}` };
       try {
-        const map = buildMap(session.index, phrase(args.rest) || undefined, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1200) });
-        return withSync(renderMap(map), session.sync);
+        const focus = phrase(args.rest);
+        // A path argument is the one file question the map answers better than a
+        // keyword: the file itself says which symbols it declares. A path that names
+        // nothing falls through to the keyword map, which answers in its own words.
+        const byPath = focus.length > 0 ? fileDetail(session.index, focus) : null;
+        if (byPath !== null) {
+          return withSync(renderFileDetail(byPath, indexMeta(session.index).scannedAt), session.sync);
+        }
+        const map = buildMap(session.index, focus || undefined, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1200) });
+        return withSync(renderMap(map, indexMeta(session.index).scannedAt), session.sync);
       } finally {
         closeDb(session.db);
       }

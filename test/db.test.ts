@@ -246,3 +246,159 @@ test("staleness comes from the rows", async () => {
   }
 });
 
+
+test("CJK text is searchable, and the excerpt is the text the file has", async () => {
+  // The failure this guards was measured on a real GDScript project: FTS5 tokenizes
+  // with unicode61, which makes a run of Chinese ONE token -- so a two-character
+  // phrase out of the middle of one matched nothing, and the answer read as "the
+  // project does not mention this". The CJK runs are padded on both sides now.
+  const root = mkdtempSync(join(tmpdir(), "memo-cjk-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    const body = ["func _ready() -> void:", "	# 日结处理：把当天的补算记进存档", "	pass", ""].join(String.fromCharCode(10));
+    writeFileSync(join(root, "src", "calendar.gd"), body, "utf8");
+    writeFileSync(join(root, "src", "helper.ts"), "export function helper() { return 1 }", "utf8");
+    const index = await buildIndex(root, { analyzer: null });
+    const paths = createMemoDir(memoPaths(root, ".memo"));
+    const opened = await openIndexDb(paths, { create: true });
+    assert.equal(opened.ok, true);
+    try {
+      writeIndex(opened.db, index);
+      const phrase = findInDb(opened.db, "日结", { limit: 10, textLimit: 3 });
+      assert.deepEqual(phrase.files.map((file) => file.relPath), ["src/calendar.gd"]);
+      assert.equal(phrase.text.length, 1, "the hit comes with an excerpt");
+      assert.equal(phrase.text[0].line, 2, "the line is the one the file has");
+      assert.equal(phrase.text[0].excerpt.some((line) => line.includes("日结处理")), true, "the excerpt is the original text");
+      assert.deepEqual(searchText(opened.db, "补算").map((row) => row.path), ["src/calendar.gd"]);
+      assert.deepEqual(findInDb(opened.db, "北极熊", { limit: 10, textLimit: 3 }).files, [], "a word that is absent stays absent");
+      assert.deepEqual(findInDb(opened.db, "helper", { limit: 10, textLimit: 3 }).files.map((file) => file.relPath), ["src/helper.ts"], "ASCII is untouched");
+    } finally {
+      closeDb(opened.db);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one file can answer with more than one symbol, and nothing more unless asked", async () => {
+  // The query that motivated this: a catalog file holding thirty-one SFX_* constants
+  // answered with exactly one of them, so a model asking about a constant had to
+  // guess ten more times for names the index already held.
+  const root = mkdtempSync(join(tmpdir(), "memo-perfile-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    const body = ["const SFX_DIR := 0", "const SFX_HIT := 1", "const SFX_MISS := 2", ""].join(String.fromCharCode(10));
+    writeFileSync(join(root, "src", "audio.gd"), body, "utf8");
+    const index = await buildIndex(root, { analyzer: null });
+    const paths = createMemoDir(memoPaths(root, ".memo"));
+    const opened = await openIndexDb(paths, { create: true });
+    assert.equal(opened.ok, true);
+    try {
+      writeIndex(opened.db, index);
+      const one = findInDb(opened.db, "SFX", { limit: 20, textLimit: 1 });
+      assert.equal(one.files.length, 1, "one answer per file, as before");
+      assert.deepEqual(one.extra, [], "and nothing extra unless it was asked for");
+      const many = findInDb(opened.db, "SFX", { limit: 20, textLimit: 1, perFile: 5, allMatches: true });
+      assert.deepEqual(many.extra.map((entry) => entry.symbol), ["SFX_DIR", "SFX_HIT", "SFX_MISS"]);
+      const capped = findInDb(opened.db, "SFX", { limit: 20, textLimit: 1, perFile: 2, allMatches: true });
+      assert.deepEqual(capped.extra.map((entry) => entry.symbol), ["SFX_DIR", "SFX_HIT"], "the cap is the count");
+    } finally {
+      closeDb(opened.db);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("match quality comes first, and the file's own standing only breaks a tie", async () => {
+  // The ladder used to be a weighted sum with importance added at ten points a
+  // unit, and importance is PageRank normalized against the mean -- 4.42 on a
+  // measured project, so 44 points, more than any two rungs are apart. This is
+  // that shape: the hub holds the *weakest* match, and it used to answer first.
+  const root = mkdtempSync(join(tmpdir(), "memo-rank-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "leaf.ts"), "export function helper() { return 1 }\n");
+    writeFileSync(join(root, "src", "pre.ts"), "export const helperThing = 2\n");
+    writeFileSync(join(root, "src", "mid.ts"), "export const my_helper = 3\nexport const HUB = 4\n");
+    for (const name of ["u1", "u2", "u3", "u4"]) {
+      writeFileSync(join(root, "src", name + ".ts"), "import { HUB } from \"./mid\";\nexport function " + name + "() { return HUB }\n");
+    }
+    const index = await buildIndex(root, { analyzer: null });
+    assert.ok(index.files["src/mid.ts"].importance > index.files["src/leaf.ts"].importance, "the hub has to really be the hub");
+    const paths = createMemoDir(memoPaths(root, ".memo"));
+    const opened = await openIndexDb(paths, { create: true });
+    try {
+      writeIndex(opened.db, index);
+      const found = findInDb(opened.db, "helper", { limit: 10, textLimit: 0 });
+      assert.deepEqual(found.files.slice(0, 3).map((file) => file.relPath), ["src/leaf.ts", "src/pre.ts", "src/mid.ts"], "the hub does not jump the ladder");
+      assert.deepEqual(found.files.slice(0, 3).map((file) => file.tier), [100, 70, 45], "exact, then a prefix, then a substring");
+    } finally {
+      closeDb(opened.db);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the file that says the query most often answers first", async () => {
+  // A body hit used to be one flat score for every matching file, ordered by the
+  // file's importance -- so a hub that mentions a term once outranked the file
+  // that is about it. For a Chinese query, where the body is the only source that
+  // can answer at all, that made the whole answer a list of important files.
+  const root = mkdtempSync(join(tmpdir(), "memo-weight-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "many.ts"), "// 日结处理：日结 hooks，日结存档\nexport const MANY = 1\n");
+    writeFileSync(join(root, "src", "once.ts"), "// 日结 只提一次\nexport const ONCE = 1\n");
+    for (const name of ["v1", "v2", "v3", "v4"]) {
+      writeFileSync(join(root, "src", name + ".ts"), "import { ONCE } from \"./once\";\nexport function " + name + "() { return ONCE }\n");
+    }
+    const index = await buildIndex(root, { analyzer: null });
+    assert.ok(index.files["src/once.ts"].importance > index.files["src/many.ts"].importance, "the single mention is in the hub");
+    const paths = createMemoDir(memoPaths(root, ".memo"));
+    const opened = await openIndexDb(paths, { create: true });
+    try {
+      writeIndex(opened.db, index);
+      const found = findInDb(opened.db, "日结", { limit: 10, textLimit: 3 });
+      assert.equal(found.files[0].relPath, "src/many.ts", "three mentions beat one, hub or no hub");
+      assert.equal(found.files[0].line, 1, "the entry carries the line the query is on, not line 0");
+      assert.equal(found.files[0].endLine, 1);
+      assert.equal(found.files[0].excerpt.some((line) => line.includes("日结处理")), true, "and the excerpt is the text around it");
+      assert.equal(found.files[1].relPath, "src/once.ts");
+    } finally {
+      closeDb(opened.db);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a scan records what it did not index, and the database keeps it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "memo-cover-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "a.ts"), "export const a = 1\n");
+    writeFileSync(join(root, "README.md"), "# 说明\n");
+    writeFileSync(join(root, "notes.txt"), "x\n");
+    writeFileSync(join(root, "make.sh"), "#!/bin/sh\n");
+    const index = await buildIndex(root, { analyzer: null });
+    assert.equal(index.coverage.seen, 4, "every file the sweep looked at is counted");
+    assert.equal(index.coverage.candidates, 1);
+    assert.equal(index.coverage.skipped, 3);
+    assert.deepEqual(index.coverage.suffixes.map((entry) => entry[0]).sort(), [".md", ".sh", ".txt"]);
+    const paths = createMemoDir(memoPaths(root, ".memo"));
+    const opened = await openIndexDb(paths, { create: true });
+    try {
+      writeIndex(opened.db, index);
+      const summary = readIndexSummary(opened.db);
+      assert.equal(summary.coverage.seen, 4, "the counts survive the database");
+      assert.equal(summary.coverage.skipped, 3);
+      assert.deepEqual(summary.coverage.suffixes.map((entry) => entry[0]).sort(), [".md", ".sh", ".txt"]);
+    } finally {
+      closeDb(opened.db);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -333,3 +333,73 @@ test("find says who calls the symbol it answers about", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a miss is worded as something the index cannot say, not as absence", async () => {
+  // The sentence used to read "索引里没有匹配 X 的符号、路径或正文", which reads as
+  // "the project does not mention this" -- the one reading a search surface must
+  // never invite, and the one an agent wrote into a report as an existence claim.
+  const root = scratch();
+  try {
+    // The index has to exist before a query can miss it: a missing index is a
+    // different message, and it is not this one.
+    await cli(root, "scan");
+    const miss = await cli(root, "find 北极熊");
+    assert.match(miss.text, /索引里没有匹配/);
+    assert.match(miss.text, /不等于项目里没有/, "the limit is said out loud");
+    assert.match(miss.text, /grep -rn/, "and the way to prove it is named");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("find prints the line a body hit is on, not the first line of the file", async () => {
+  // A GDScript file opens with @tool, class_name and extends. Entries used to
+  // carry line 0, so every body hit previewed line 1 and a whole Chinese query
+  // came back as nine of those -- while the matched line waited in a block at the
+  // very end, which is also the first thing the budget cut.
+  const root = mkdtempSync(join(tmpdir(), "memo-cli-line-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "clock.gd"), ["@tool", "class_name Clock", "extends Node", "", "# 日结处理：把当天的补算记进存档", "func roll() -> void:", "\tpass", ""].join(String.fromCharCode(10)));
+    assert.match((await cli(root, "scan")).text, /已重建索引/);
+    const found = await cli(root, "find 日结");
+    assert.match(found.text, /src\/clock\.gd:5/, "the heading carries the line the query is on");
+    assert.match(found.text, /日结处理/, "and the excerpt is printed with it");
+    assert.doesNotMatch(found.text, /1: @tool/, "nothing previews line one any more");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the first symbol hit's body is printed once", async () => {
+  // The preview window was the symbol's own range, and the body repeated it: a
+  // 33-line function arrived twice, at 1,109 tokens, and the duplicate spent half
+  // the budget the hit list needed.
+  const root = mkdtempSync(join(tmpdir(), "memo-cli-once-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "core.ts"), ["export function alpha() {", "  return 1;", "}", ""].join(String.fromCharCode(10)));
+    await cli(root, "scan");
+    const found = await cli(root, "find alpha");
+    assert.equal(found.text.split("return 1;").length - 1, 1, "once as the body, and not again as a preview");
+    assert.match(found.text, /src\/core\.ts:1-3/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("status says what the index cannot see", async () => {
+  const root = mkdtempSync(join(tmpdir(), "memo-cli-blind-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "a.ts"), "export const a = 1\n");
+    writeFileSync(join(root, "README.md"), "# 说明\n");
+    await cli(root, "scan");
+    const status = await cli(root, "status");
+    assert.match(status.text, /索引盲区：/, "a miss has to say what the index could not have seen");
+    assert.match(status.text, /未索引 1 个/);
+    assert.match(status.text, /\.md 1/, "and the suffix says where to look instead");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

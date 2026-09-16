@@ -30,11 +30,11 @@ allowBuilds:
 模型侧 `memo` 工具的唯一参数是命令行字符串；人侧 `/memo` 用同一套语法。一个工具而不是每个操作一个，是为了只让一份 description 常驻模型上下文。
 
 ```
-memo status     [--notes N]                        读   四节 STATUS + 最近 journal + bug 数 + 索引状态
+memo status     [--notes N]                        读   四节 STATUS + 最近 journal + bug 数 + 索引状态与盲区（未索引文件数 + 盲区后缀）
 memo handoff    [--now|--next|--open|--avoid T]    写   更新 STATUS.md，只替换传入的节
 memo note       TEXT [--kind note|decision|todo]   写   向 journal.jsonl 追加一行
 memo scan       [--exclude DIR]                    写   重建代码索引（本地 .memo/index.db）
-memo find       QUERY [--bodies N] [--callers N]   读   符号/路径/正文三处一起找；首个命中给正文和调用点
+memo find       QUERY [--bodies N] [--callers N]   读   符号/路径/正文三处一起找；按匹配质量排序，每条给行号，前几条直接给正文或命中行摘录
 memo map        [FOCUS] [--budget N]               读   按目录汇总或聚焦主题
 memo bug-search TERM [--limit N]                   读   按症状检索历史修法，重复次数参与排序
 memo bug-log    --error T [--cause|--fix|…]        写   记一条修复，同症状累加次数
@@ -80,7 +80,9 @@ index.db       代码索引（memo scan 产出）——本地 SQLite：文件、
 ## 已知限制
 
 - `.gitignore` 只读“一行一个名字”的那部分（`lib/`、`build`、`*.min.js`）：带斜杠的锚定模式、`!` 反选和嵌套 `.gitignore` 不管，点开头的目录一律跳过。
-- `memo find` 默认只展开首个命中的正文（约 80 行封顶），预算 2000 tokens；要更多用 `--bodies N` 或 `--full`。
+- `memo find` 命中按**匹配质量**排序，文件重要性只在同一档内决胜：精确名 > 前缀 > 包含 > 路径 > 正文 > 描述。正文命中再按「这个文件提到几次」排。
+- `memo find` 的清单每条带行号：符号命中给声明范围，正文命中给命中行（默认前 5 处；再往后的只给文件路径）。**正文摘录就地打印在命中条目下面**，`--bodies 0` 只要行号不要摘录；**符号命中**默认展开第一段正文（每段约 80 行封顶，`--full` 解除）。整个答案的预算 2000 tokens，截断从清单尾部切起，不会先砍掉正文。
+- `memo status` / `memo scan` 会报**索引盲区**：未索引文件数 + 最大的几个后缀（`.md`、`.cfg`、`.csv`、`.sh` …）。索引只覆盖 `.js/.mjs/.cjs/.jsx/.ts/.mts/.cts/.tsx/.py/.go/.rs/.gd/.tscn/.tres/.json`，其余文件 `memo find` 一律看不见——这一行就是「找不到」和「没有」的分界。旧索引要等下一次 `memo scan` 或 `memo find`（会自动同步）才带这一行。
 - 调用点默认列 6 条（`--callers N`，0 = 不列），判不出来的只报数量。receiver 的类型只从同文件的 `name: Type` 注解和 `Foo.new()` 推断，不跟 `extends` 继承链；`connect(..., _on_pressed)` 这类回调引用不算调用。
 - `refresh` 用同步 `statSync`；大项目嫌贵可设 `refresh: false`。
 - `exact` 首次计数要解析 6MB 词表（约 150ms），之后常驻内存；默认 `estimated`，两种单位不能混进同一份索引。
@@ -98,7 +100,7 @@ index.db       代码索引（memo scan 产出）——本地 SQLite：文件、
 npm install      # node_modules 不入库；tree-sitter 是 optional
 npm run build    # src/*.ts -> lib/*.js
 npm run check    # tsc --noEmit
-npm test         # build 后运行 111 个测试
+npm test         # build 后运行 130 个测试
 ```
 
 `src/` 是 TypeScript 源码，`lib/` 是 `npm run build` 的产物（不入库），`tokenizer/` 是随包的 DeepSeek V4 词表。

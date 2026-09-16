@@ -17,7 +17,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, join, posix, relative, resolve } from "node:path";
 import { countTokens } from "./tokenizer.ts";
-import type { IndexCall, IndexEntry, IndexSymbol, MemoIndex, TokenMode, TsAnalyzer } from "./types.ts";
+import type { IndexCall, IndexCoverage, IndexEntry, IndexSymbol, MemoIndex, TokenMode, TsAnalyzer } from "./types.ts";
 
 /** What {@link buildIndex} and {@link refreshIndex} accept. */
 export interface IndexOptions {
@@ -54,14 +54,32 @@ export interface BudgetOptions {
  * (\`./db.ts\`). The rows carry the same fields, so extraction and ranking did
  * not change -- but the medium did, and an index written in the old one cannot
  * be read from the new one, which is exactly what a version is for.
+ *
+ * 6 is what 5 was, searched by a full-text table that could not read CJK.
+ *
+ * 7 can search CJK text at all. FTS5 tokenizes with unicode61 by default, and
+ * unicode61 does not segment CJK: a run of Chinese is *one* token, so a query
+ * for a two-character phrase out of the middle of one matched nothing. The
+ * answer then read as "the project does not mention this" rather than "the
+ * index cannot say" -- the one failure a search surface must not have. On a
+ * measured GDScript project such a term lived in 26 files, was in the index in
+ * all of them, and matched none. The body, the path and the description are now
+ * stored pre-tokenized (see padCjk in the tokenizer) and a query is padded the
+ * same way, so a CJK phrase is the consecutive run of one-character tokens
+ * that a phrase query already means. A version 6 database is rescanned rather
+ * than read: only a scan writes the new columns, and the old ones cannot answer
+ * a CJK query at all.
  */
-export const INDEX_VERSION = 6;
+export const INDEX_VERSION = 7;
 export const DEFAULT_EXCLUDES = [
   "node_modules", ".git", ".memo", "dist", "build", "out", "target", "vendor",
   ".venv", "venv", "__pycache__", ".next", ".nuxt", ".cache", "coverage", ".idea", ".vscode",
 ];
 export const MAX_FILE_BYTES = 512 * 1024;
 export const MAX_FILES = 20_000;
+/** How many unindexed suffixes a coverage report names; the rest are counted, not named. */
+export const COVERAGE_SUFFIXES = 24;
+
 /** Below this many estimated tokens a file is not worth a tree-sitter parse. */
 export const TS_MIN_TOKENS = 500;
 
@@ -735,7 +753,40 @@ function ignoredName(name, ignored) {
   return false;
 }
 
-function walk(root, excludes, ignored, files, depth = 0) {
+/**
+ * One sweep tally: what the walk looked at, and what the extension table kept.
+ *
+ * A walk that returns only the files it accepted cannot say what it dropped, and
+ * the difference is the whole of what a search can answer about. Counting it
+ * costs nothing beyond the readdir the scan was doing anyway.
+ */
+function newTally() {
+  return { seen: 0, candidates: 0, failed: 0, skipped: 0, suffixes: new Map() };
+}
+
+/** A file the extension table does not accept, counted under its suffix. */
+function countSkipped(tally, ext) {
+  const suffix = ext.length > 0 ? ext : "(无后缀)";
+  tally.skipped += 1;
+  tally.suffixes.set(suffix, (tally.suffixes.get(suffix) ?? 0) + 1);
+}
+
+/** The tally as the index carries it: biggest suffixes first, capped. */
+function coverageOf(tally: { seen: number; candidates: number; failed: number; skipped: number; suffixes: Map<string, number> }): IndexCoverage {
+  const suffixes = [...tally.suffixes.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, COVERAGE_SUFFIXES);
+  return { seen: tally.seen, candidates: tally.candidates, failed: tally.failed, skipped: tally.skipped, suffixes };
+}
+
+/**
+ * Every file worth considering, in one sweep.
+ *
+ * @param tally - when given, filled in with what was seen and skipped. A capped
+ *   walk (MAX_FILES) fills in what it managed to visit, which is the honest
+ *   number for the index that walk produced.
+ */
+function walk(root, excludes, ignored, files, depth = 0, tally = null) {
   if (files.length >= MAX_FILES || depth > 24) return;
   let entries;
   try {
@@ -753,13 +804,18 @@ function walk(root, excludes, ignored, files, depth = 0) {
     if (entry.isDirectory()) {
       if (excludes.has(entry.name)) continue;
       if (ignoredName(entry.name, ignored)) continue;
-      walk(full, excludes, ignored, files, depth + 1);
+      walk(full, excludes, ignored, files, depth + 1, tally);
       continue;
     }
     if (!entry.isFile()) continue;
     if (ignoredName(entry.name, ignored)) continue;
     const language = LANGUAGE[extname(entry.name)];
-    if (language === undefined) continue;
+    if (tally !== null) tally.seen += 1;
+    if (language === undefined) {
+      if (tally !== null) countSkipped(tally, extname(entry.name).toLowerCase());
+      continue;
+    }
+    if (tally !== null) tally.candidates += 1;
     files.push({ full, language, ext: extname(entry.name).toLowerCase() });
   }
 }
@@ -886,12 +942,14 @@ export async function buildIndex(root: string, options: IndexOptions = {}): Prom
   const analyzer = options.analyzer ?? null;
   const counter = resolveTokenCounter(options, options.log);
   const found: Array<{ full: string; language: string; ext: string }> = [];
-  walk(resolved, excludes, gitignoredNames(resolved), found);
+  const tally = newTally();
+  walk(resolved, excludes, gitignoredNames(resolved), found, 0, tally);
 
   const files: Record<string, IndexEntry> = {};
   for (const { full, language, ext } of found) {
     const one = await indexOneFile(resolved, full, language, ext, maxBytes, analyzer, counter);
     if (one !== null) files[one.rel] = one.entry;
+    else tally.failed += 1;
   }
 
   rankByImportance(files);
@@ -911,6 +969,9 @@ export async function buildIndex(root: string, options: IndexOptions = {}): Prom
     fileCount: Object.keys(files).length,
     totalTokens: Object.values(files).reduce((sum, file) => sum + file.tokens, 0),
     symbolSource: symbolSourceOf(files),
+    // What this scan could not see, kept with the index rather than recomputed by
+    // whoever asks: only a scan is walking the tree anyway.
+    coverage: coverageOf(tally),
     files,
   };
 }
@@ -985,7 +1046,8 @@ export async function refreshIndex(index: MemoIndex, options: IndexOptions = {})
 
   const excludes = new Set([...DEFAULT_EXCLUDES, ...requested]);
   const found: Array<{ full: string; language: string; ext: string }> = [];
-  walk(root, excludes, gitignoredNames(root), found);
+  const tally = newTally();
+  walk(root, excludes, gitignoredNames(root), found, 0, tally);
 
   const previous: Record<string, IndexEntry> = index.files ?? {};
   const files: Record<string, IndexEntry> = {};
@@ -1012,7 +1074,10 @@ export async function refreshIndex(index: MemoIndex, options: IndexOptions = {})
       }
     }
     const one = await indexOneFile(root, full, language, ext, maxBytes, analyzer, counter);
-    if (one === null) continue; // over the cap, binary, or unreadable
+    if (one === null) {
+      tally.failed += 1; // over the cap, binary, or unreadable
+      continue;
+    }
     files[one.rel] = one.entry;
     if (before === undefined) added.push(one.rel);
     else updated.push(one.rel);
@@ -1035,6 +1100,7 @@ export async function refreshIndex(index: MemoIndex, options: IndexOptions = {})
       fileCount: Object.keys(files).length,
       totalTokens: Object.values(files).reduce((sum, file) => sum + file.tokens, 0),
       symbolSource: symbolSourceOf(files),
+      coverage: coverageOf(tally),
       files,
     },
     added,
