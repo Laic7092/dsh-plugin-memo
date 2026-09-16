@@ -27,6 +27,36 @@ async function scanned(paths, root) {
   return { index, db: opened.db };
 }
 
+test("an identifier search matches the identifier, not two words near each other", async () => {
+  // FTS5 tokenizes on the underscore, so `migrate_save` used to be the phrase
+  // `migrate save`: a regex literal reading migrate|save_version|upgrade_save
+  // answered a question about the function migrate_save. The phrase finds the
+  // words; the boundary check is what makes it the identifier.
+  const root = mkdtempSync(join(tmpdir(), "memo-ident-"));
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "save.gd"), "func migrate_save() -> void:" + String.fromCharCode(10) + "	pass" + String.fromCharCode(10), "utf8");
+    writeFileSync(join(root, "src", "audit.py"), "PATTERNS = [r\"migrate|save_version|upgrade_save\"]\n", "utf8");
+    const index = await buildIndex(root, { analyzer: null });
+    // The memo directory is what the database lives in, so it has to exist first --
+    // which is what createMemoDir is for, and what the plugin does before a scan.
+    const paths = createMemoDir(memoPaths(root));
+    const opened = await openIndexDb(paths, { create: true });
+    assert.equal(opened.ok, true);
+    try {
+      writeIndex(opened.db, index);
+      const ident = findInDb(opened.db, "migrate_save", { limit: 10, textLimit: 2 });
+      assert.deepEqual(ident.files.map((file) => file.relPath), ["src/save.gd"], "the regex literal is not an answer");
+      const word = findInDb(opened.db, "migrate", { limit: 10, textLimit: 2 });
+      assert.equal(word.files.some((file) => file.relPath === "src/audit.py"), true, "a plain word is still a word search");
+    } finally {
+      closeDb(opened.db);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the index round-trips through the database", async () => {
   const root = project();
   const paths = createMemoDir(memoPaths(root, ".memo"));

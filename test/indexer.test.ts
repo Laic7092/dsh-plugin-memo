@@ -128,6 +128,41 @@ test("a project's own .gitignore keeps generated trees out of the index", async 
     rmSync(base, { recursive: true, force: true });
   }
 });
+test("a JSON file is indexed for its keys, and still searchable as a body", async () => {
+  // Game data lives in these files and nowhere else: the item ids, the prices,
+  // the schedules. Indexing them as code would be a lie; not indexing them at
+  // all left `find` unable to answer about the files a data change touches.
+  const root = mkdtempSync(join(tmpdir(), "memo-json-"));
+  try {
+    mkdirSync(join(root, "data"), { recursive: true });
+    writeFileSync(
+      join(root, "data", "items.json"),
+      [
+        "{",
+        '  "turnip": { "price": 60, "growth_days": 4 },',
+        '  "potato": { "price": 80, "growth_days": 6 }',
+        "}",
+        "",
+      ].join(String.fromCharCode(10)),
+      "utf8",
+    );
+    const index = await buildIndex(root, { analyzer: null });
+    const entry = index.files["data/items.json"];
+    assert.equal(entry.language, "json");
+    assert.deepEqual(entry.symbols.map((symbol) => [symbol.name, symbol.line]), [
+      ["turnip", 2],
+      ["price", 2],
+      ["growth_days", 2],
+      ["potato", 3],
+      ["price", 3],
+      ["growth_days", 3],
+    ]);
+    assert.deepEqual(entry.calls, [], "a data file calls nothing");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("findInIndex ranks an exact symbol above a path hit and respects the budget", async () => {
   const base = fixture();
   try {

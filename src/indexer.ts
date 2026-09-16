@@ -74,6 +74,11 @@ const LANGUAGE = {
   // Godot's text resource formats. Not code, but they carry the scene tree and
   // every `res://` dependency a Godot project actually runs on.
   ".tscn": "gdres", ".tres": "gdres",
+  // Game and tool data. Not code, and often the only place a project's real
+  // vocabulary lives: an item id, a drop table, an NPC's schedule. Indexed for
+  // the same reason the scene formats are -- `find` has to answer about the
+  // files a change actually touches.
+  ".json": "json",
 };
 
 /**
@@ -576,8 +581,63 @@ function extractGdResourceSymbols(lines) {
   return symbols;
 }
 
+/**
+ * The keys of a JSON document, as symbols.
+ *
+ * Depth is the whole question here. A top-level key is the file's shape --
+ * `items`, `villagers` -- and is what a reader means by "what is in this file";
+ * the entries inside it are what somebody actually searches for by name. So the
+ * top level is always taken, the strings directly inside those objects are taken
+ * as well, and the two together are capped: a 4000-entry localisation table is a
+ * body to search, not a symbol list to print.
+ *
+ * Lines are found by scanning the text for the key, because JSON.parse does not
+ * report positions and a pretty-printed file puts one key per line. A key the
+ * scan cannot place keeps the last position it saw rather than a guess.
+ */
+// A file's own shape is what `map`/`find --file` read, and it is what has to stay
+// intact however big the file is: 40 top-level keys for a data file's entries, 4
+// nested keys per entry to say what one entry holds, and a hard ceiling so a
+// texture atlas cannot pour a hundred identical `name`/`icon` keys into search.
+const JSON_TOP_KEYS = 40;
+const JSON_ENTRY_KEYS = 4;
+const JSON_KEYS = 400;
+function extractJsonSymbols(lines: string[]): IndexSymbol[] {
+  const text = lines.join(String.fromCharCode(10));
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  const keyLine = (key: string, from: number): { line: number; endLine: number } => {
+    const pattern = new RegExp("[\\\"\\\\]" + key.replace(/[.*+?^${}()|[\]\\\\]/g, "\\\\function extractSymbols(lines, language) {") + "[\\\"\\\\]\\s*:");
+    for (let i = from; i < lines.length; i += 1) {
+    if (pattern.test(lines[i])) return { line: i + 1, endLine: i + 1 };
+  }
+    return { line: from + 1 > 0 ? from + 1 : 1, endLine: from + 1 > 0 ? from + 1 : 1 };
+  };
+  const symbols: IndexSymbol[] = [];
+  let cursor = 0;
+  const top = Object.entries(parsed).slice(0, JSON_TOP_KEYS);
+  for (const [key, value] of top) {
+    const at = keyLine(key, cursor);
+    cursor = Math.max(0, at.line - 1);
+    symbols.push({ name: key, kind: "key", line: at.line, endLine: at.line });
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    for (const child of Object.keys(value).slice(0, JSON_ENTRY_KEYS)) {
+      if (symbols.length >= JSON_KEYS) break;
+      const where = keyLine(child, cursor);
+      cursor = Math.max(cursor, where.line - 1);
+      symbols.push({ name: child, kind: "key", line: where.line, endLine: where.line });
+    }
+  }
+  return symbols;
+}
 function extractSymbols(lines, language) {
   if (language === "gdres") return extractGdResourceSymbols(lines);
+  if (language === "json") return extractJsonSymbols(lines);
   const rules = RULES[language] ?? [];
   const symbols = [];
   for (let i = 0; i < lines.length; i++) {
@@ -607,7 +667,10 @@ function describe(lines) {
       if (started && collected.length > 0) break;
       continue;
     }
-    const isComment = /^(\/\/|\/\*|\*|#|"""|--)/.test(trimmed);
+    // A shebang is not a comment: it carries the interpreter, and `#!/usr/bin/env
+    // python3` read as a hash comment loses the `#` and describes the file as
+    // "!/usr/bin/env python3".
+    const isComment = !trimmed.startsWith("#!") && /^(\/\/|\/\*|\*|#|"""|--)/.test(trimmed);
     if (!started) {
       if (!isComment) return null;
       started = true;
@@ -1577,9 +1640,15 @@ export function buildMap(index: MemoIndex, focus: string | null, options: Budget
       }
     }
     if (score === 0) continue;
-    scored.push({ relPath, score: score + file.importance * 12, importance: file.importance, tokens: file.tokens, description: file.description, symbols: file.symbols.length });
+    // Whether a symbol *is* the term, rather than a file that mentions it.
+    // Search relevance and standing are different questions, and without this
+    // the second one answers the first: a scene with a fat description and a
+    // high import rank used to outrank the script that declares the name.
+    const named = file.symbols.some((symbol) => terms.includes(symbol.name.toLowerCase()));
+    const exact = file.symbols.some((symbol) => symbol.name.toLowerCase() === terms[0]);
+    scored.push({ relPath, score: score + file.importance * 12, named, exact, importance: file.importance, tokens: file.tokens, description: file.description, symbols: file.symbols.length });
   }
-  scored.sort((a, b) => b.score - a.score || a.relPath.localeCompare(b.relPath));
+  scored.sort((a, b) => Number(b.exact) - Number(a.exact) || Number(b.named) - Number(a.named) || b.score - a.score || a.relPath.localeCompare(b.relPath));
   const files = [];
   let spent = 0;
   for (const entry of scored) {

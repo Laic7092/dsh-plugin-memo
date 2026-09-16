@@ -157,17 +157,25 @@ function renderFileDetail(detail) {
  * body; a best answer with no body (a path hit) leaves the budget to the first
  * hit that has one.
  */
-function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number; callers?: number; index?: MemoIndex | null } = {}) {
+function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number; callers?: number; full?: boolean; index?: MemoIndex | null } = {}) {
   const budget = Number.isFinite(options.budgetTokens) ? options.budgetTokens : FIND_BUDGET;
   const bodies = clampInt(options.bodies, 0, 8, 1);
   const callers = clampInt(options.callers, 0, 50, FIND_CALLERS);
+  // `--full` is the only thing that lifts the per-body line cap; the count is the
+  // count of bodies. Both spend the same budget, which is what makes the number
+  // in the footer true.
+  const bodyLines = options.full === true ? Number.MAX_SAFE_INTEGER : FIND_BODY_LINES;
+  let moreBodies = false;
   const index = options.index ?? null;
   if (result.files.length === 0 && result.text.length === 0) {
     return `索引里没有匹配 "${query}" 的符号、路径或正文（索引共 ${fmt(meta.fileCount)} 个文件，${fmt(meta.symbolCount)} 个符号）。`;
   }
   const unit = meta.tokens === "exact" ? "exact" : "estimated";
   const counter = costUnit(unit);
-  let spent = 0;
+  // The two chrome lines are part of every answer, so they are reserved before
+  // anything is chosen rather than discovered at the end.
+  const chromeReserve = 40;
+  let spent = chromeReserve;
   let shown = 0;
   let truncated = false;
   const out = [];
@@ -207,7 +215,9 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
           spent += lineCost;
           out.push(line);
         }
-        if (resolved > report.callers.length) out.push("    ... 还有 " + fmt(resolved - report.callers.length) + " 处，--callers 可以加");
+        const callerMore = resolved > report.callers.length ? "    ... 还有 " + fmt(resolved - report.callers.length) + " 处，--callers 可以加" : "";
+        if (callerMore.length > 0 && spent + counter(callerMore) + 1 <= budget) { spent += counter(callerMore) + 1; out.push(callerMore); }
+        else if (callerMore.length > 0) truncated = true;
         const notes = [];
         if (report.elsewhere > 0) notes.push(fmt(report.elsewhere) + " 处同名调用落在别的文件");
         if (report.ambiguous > 0) {
@@ -220,7 +230,7 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
     }
     // The body, for the first hit that has one and no more unless asked.
     if (shown > bodies || !file.symbol) continue;
-    const body = symbolBody(db, file.relPath, file.line, file.endLine, FIND_BODY_LINES);
+    const body = symbolBody(db, file.relPath, file.line, file.endLine, bodyLines);
     if (body === null) continue;
     const bodyCost = counter(body.text) + 2;
     if (spent + bodyCost > budget) {
@@ -230,18 +240,49 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
     spent += bodyCost;
     // The range is already in the heading above; the body speaks for itself.
     out.push(body.text);
-    if (body.more > 0) out.push(`    ... 还有 ${body.more} 行，用 --full 或 --file ${file.relPath}`);
+    // Both tails are measured like everything else: they are part of the answer a
+    // reader pays for, and one that does not fit is said in the footer instead.
+    const bodyMore = body.more > 0 ? `    ... 还有 ${body.more} 行，用 --full 或 --file ${file.relPath}` : "";
+    if (bodyMore.length > 0 && spent + counter(bodyMore) + 1 <= budget) { spent += counter(bodyMore) + 1; out.push(bodyMore); }
+    else if (body.more > 0) truncated = true;
   }
+  if (bodies > 0 && shown > bodies && result.files.slice(bodies).some((file) => file.symbol)) moreBodies = true;
+  // Body excerpts answer the same question as a body does, so they spend the
+  // same budget and obey the same count. This used to be bolted on after the
+  // budget was settled, which is how a 100-token answer arrived at 1561
+  // characters.
   for (const hit of result.text) {
-    out.push(`${hit.relPath}:${hit.line}  正文命中`);
+    if (bodies <= 0) break;
+    const headLine = `${hit.relPath}:${hit.line}  正文命中`;
+    const cost = counter(headLine) + hit.excerpt.reduce((sum, line) => sum + counter(line), 0) + 2;
+    if (spent + cost > budget && shown > 0) { truncated = true; break; }
+    spent += cost;
+    out.push(headLine);
     for (const excerpt of hit.excerpt) out.push("    " + excerpt);
   }
+  // Everything a reader pays for is measured, this line included: the number in
+  // it used to be the sum of the headings and bodies, so a 100-token answer
+  // reported 84 and arrived at 121.
+  // Everything a reader pays for is measured, this line included. The number it
+  // reports is the real cost of the answer -- headings, bodies, excerpts and the
+  // two lines of chrome -- because a budget that under-reports itself is not a
+  // budget: a 100-token answer used to say 84 and arrive at 119.
   const head = [
-    `索引命中 ${fmt(result.total)} 个文件 · 列出 ${fmt(shown)} 个 · ${tokenAmount(spent, unit)}/${fmt(budget)}`,
+    `${fmt(result.total)} 个文件命中 · 列出 ${fmt(shown)} 个`,
     result.text.length > 0 ? `${result.text.length} 处正文命中` : "",
     truncated ? "被预算截断，--budget 可加" : "",
+    !truncated && moreBodies ? "还有命中有正文，--bodies 可加" : "",
   ].filter((part) => part.length > 0).join(" · ");
-  return `${[head, "", ...out].join(String.fromCharCode(10)).trimEnd()}${String.fromCharCode(10)}`;
+  // What the reader actually gets, counted rather than estimated: the reserve came
+  // off, the chrome goes on, and the number in the line is the cost of the line
+  // that carries it.
+  const content = Math.max(0, spent - chromeReserve);
+  const reported = content + counter(head) + counter(`${tokenAmount(content, unit)}/${fmt(budget)}`);
+  const totalLine = `共 ${tokenAmount(reported, unit)}/${fmt(budget)}${reported > budget ? "（超：第一条命中无法再切）" : ""}`;
+  const headFull = head + " · " + totalLine;
+  const body = [headFull, "", ...out].join(String.fromCharCode(10)).trimEnd();
+  return `${body}${String.fromCharCode(10)}`;
+
 }
 
 /**
@@ -465,9 +506,11 @@ async function runFind(session, args) {
   const result = findInDb(session.db, query, { limit: FIND_CANDIDATES, textLimit: FIND_TEXT });
   const meta = indexMeta(session.index);
   const budget = clampInt(args.flags.budget, 100, 20000, FIND_BUDGET);
-  const bodies = full ? 8 : args.flags.bodies === undefined ? 1 : clampInt(args.flags.bodies, 0, 8, 1);
+  // The count is the count; `--full` only lifts the per-body line cap, so
+  // `--bodies 2 --full` means two whole bodies rather than sixteen halves.
+  const bodies = args.flags.bodies === undefined ? 1 : clampInt(args.flags.bodies, 0, 8, 1);
   const callers = args.flags.callers === undefined ? FIND_CALLERS : clampInt(args.flags.callers, 0, 50, FIND_CALLERS);
-  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies, callers, index: session.index }) };
+  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies, callers, full, index: session.index }) };
 }
 
 //#endregion
@@ -729,9 +772,9 @@ export const MEMO_COMMANDS = [
     summary: "在索引里定位符号/路径/正文：给行号，首个命中给正文和调用点；回答前自动复核索引",
     flags: {
       file: { kind: "string", hint: "PATH", description: "改成一个具体文件：给它的描述和符号行范围" },
-      budget: { kind: "int", hint: "N", description: "答案的 token 预算（默认 2000）" },
-      bodies: { kind: "int", hint: "N", description: "展开几个命中的正文（默认 1；0 = 只要行号）" },
-      full: { kind: "bool", description: "展开每个有正文的命中（等于 --bodies 8）" },
+      budget: { kind: "int", hint: "N", description: "整个答案的 token 预算（默认 2000）：清单、正文、调用点、正文摘录都算在里面" },
+      bodies: { kind: "int", hint: "N", description: "展开几段正文（默认 1；0 = 不要正文，也不要正文摘录，只要行号）" },
+      full: { kind: "bool", description: "正文不截断（默认每段 80 行；段数仍由 --bodies 决定，总量仍受 --budget 限制）" },
       callers: { kind: "int", hint: "N", description: "首个命中的符号列几个调用点（默认 6；0 = 不列）" },
     },
     async run(ctx, args) {

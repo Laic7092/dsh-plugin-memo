@@ -491,6 +491,31 @@ export function dbStaleFiles(db, root, limit = 10) {
 }
 
 /**
+ * Whether a query is one identifier rather than words, and so has to match as one.
+ *
+ * FTS5 reads `migrate_save` as the phrase `migrate save`, because its tokenizer
+ * splits on the underscore. That made every ident-shaped query a bag of words:
+ * a regex literal reading `migrate|save_version|upgrade_save` was a text hit for
+ * `migrate_save`, and a file that merely mentions both words matched one that
+ * declares the name. Underscores, digits, dots and a case change are the marks
+ * of the second kind of query -- a plain lowercase word stays a word search.
+ */
+function identifierShaped(needle) {
+  const text = String(needle ?? "").trim();
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text)) return false;
+  return /[_$0-9]/.test(text) || /[a-z][A-Z]/.test(text);
+}
+
+/** Whether the body holds this identifier itself, with a boundary on each side. */
+function hasIdentifier(body, name) {
+  const pattern = new RegExp("(^|[^A-Za-z0-9_$])" + name.replace(/[.*+?^${}()|[\]]/g, "\\\\" + "\\$&") + "([^A-Za-z0-9_$]|$)", "i");
+  return pattern.test(String(body ?? ""));
+}
+/**
+ * One person's phrase as an FTS5 query: every word quoted, all of them required.") + "([^A-Za-z0-9_$]|$)", "i");
+  return pattern.test(String(body ?? ""));
+}
+/**
  * One person's phrase as an FTS5 query: every word quoted, all of them required.
  *
  * FTS5's own syntax is not what a caller means. A hyphen is a column filter, a
@@ -596,7 +621,11 @@ export function findInDb(db, query, options: { limit?: number; textLimit?: numbe
       source: row.path ? "path" : "description",
     });
   }
+  const wantIdentifier = identifierShaped(needle);
   for (const row of queryRows(db, TEXT_QUERY, [ftsQuery(needle), limit])) {
+    // The phrase found the words; only the reader can tell whether they are the
+    // identifier that was asked for.
+    if (wantIdentifier && !hasIdentifier(bodyOf(db, row.relPath), needle)) continue;
     keep({
       relPath: row.relPath,
       score: 20 + Number(row.importance ?? 0) * 10,
