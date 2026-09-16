@@ -4,8 +4,9 @@
  * The point is not to know everything about the code — it is to answer "where
  * is X" without paying for a directory walk, and "what matters here" without
  * reading twenty files. So the index keeps, per file: size, estimated tokens,
- * a one-line description, the symbols with their line ranges, and an importance
- * score derived from the import graph (PageRank, the same shape OpenWolf uses).
+ * a one-line description, the symbols with their line ranges, the call sites as
+ * they were written, and an importance score derived from the import graph
+ * (PageRank, the same shape OpenWolf uses).
  *
  * There is no parser here and no tree-sitter: extraction is line-based and
  * deliberately conservative. A heuristic that misses an exotic declaration is
@@ -16,7 +17,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, join, posix, relative, resolve } from "node:path";
 import { countTokens } from "./tokenizer.ts";
-import type { IndexEntry, IndexSymbol, MemoIndex, TokenMode, TsAnalyzer } from "./types.ts";
+import type { IndexCall, IndexEntry, IndexSymbol, MemoIndex, TokenMode, TsAnalyzer } from "./types.ts";
 
 /** What {@link buildIndex} and {@link refreshIndex} accept. */
 export interface IndexOptions {
@@ -54,7 +55,7 @@ export interface BudgetOptions {
  * not change -- but the medium did, and an index written in the old one cannot
  * be read from the new one, which is exactly what a version is for.
  */
-export const INDEX_VERSION = 5;
+export const INDEX_VERSION = 6;
 export const DEFAULT_EXCLUDES = [
   "node_modules", ".git", ".memo", "dist", "build", "out", "target", "vendor",
   ".venv", "venv", "__pycache__", ".next", ".nuxt", ".cache", "coverage", ".idea", ".vscode",
@@ -293,6 +294,53 @@ function commentFree(lines, language) {
   const body = HASH_COMMENT.has(language) ? lines.map(stripHashComment) : lines;
   const joined = body.join(String.fromCharCode(10));
   return SLASH_COMMENT.has(language) ? stripComments(joined, false) : joined;
+}
+
+/**
+ * A file's lines with its comments gone and its string literals emptied: the
+ * text a call-site scan can trust.
+ *
+ * Stricter than {@link commentFree}, and for the opposite reason. An import
+ * specifier *is* a string literal, while a call written inside one is not a call
+ * at all -- and neither is a line of prose that happens to read retry(). The
+ * hash languages keep their own reader for the same reason {@link stripHash}
+ * exists, and a triple-quoted block is tracked because a docstring is a string
+ * that spans lines, which is the one thing a line-at-a-time stripper cannot see
+ * close.
+ */
+export function codeOnly(lines, language) {
+  if (language === "js" || language === "go" || language === "rs") {
+    return stripComments(lines.join(String.fromCharCode(10)), true).split(String.fromCharCode(10));
+  }
+  if (language !== "py" && language !== "gd") return [];
+  const out = [];
+  let fence = null;
+  for (const line of lines) {
+    if (fence !== null) {
+      const close = line.indexOf(fence);
+      if (close === -1) {
+        out.push("");
+        continue;
+      }
+      fence = null;
+      out.push(stripHash(line.slice(close + 3)));
+      continue;
+    }
+    const opened = fenceAt(line);
+    if (opened !== null && line.indexOf(opened.marker, opened.at + 3) === -1) {
+      fence = opened.marker;
+      out.push(stripHash(line.slice(0, opened.at)));
+      continue;
+    }
+    out.push(stripHash(line));
+  }
+  return out;
+}
+
+/** The first triple-quote in a line, and which of the two markers it is. */
+function fenceAt(line) {
+  const at = line.search(/"""|'''/);
+  return at === -1 ? null : { at, marker: line.slice(at, at + 3) };
 }
 
 /**
@@ -708,6 +756,10 @@ async function indexOneFile(root, full, language, ext, maxBytes, analyzer, count
       symbolSource,
       importance: 0,
       imports: collectImports(lines, language),
+      // The calls this file makes, as written. What they resolve to is a fact
+      // about the whole project, so it is decided when somebody asks -- see
+      // calls.ts for why storing it here would rot.
+      calls: collectCalls(lines, language, symbols),
       // Only GDScript has one; the field is always present so the entry shape
       // does not depend on the language.
       className: globalNameOf(text, language),
@@ -961,6 +1013,175 @@ function collectImports(lines, language) {
   return [...specs];
 }
 
+/** Syntax that looks like a call: if( is not a call to if. */
+const KEYWORDS = new Set([
+  "if", "for", "while", "switch", "catch", "return", "typeof", "sizeof", "new",
+  "delete", "await", "yield", "else", "do", "try", "with", "case", "match",
+  "in", "is", "not", "and", "or", "lambda", "function", "class", "def", "func",
+  "fn", "var", "const", "let", "signal", "super", "when", "where", "until",
+]);
+
+/** The word before a name that means it is being declared, not called. */
+const DECLARED_AFTER = new Set([
+  "func", "def", "fn", "function", "class", "struct", "enum", "interface",
+  "type", "signal", "var", "const", "let", "static", "import", "from", "use",
+  "extends", "implements", "sub", "macro", "operator", "property", "namespace",
+  "typedef", "trait", "impl", "mod",
+]);
+
+/** Receivers that mean "this object", where the file itself is the candidate. */
+const SELF_RECEIVER = new Set(["self", "this", "cls"]);
+
+/**
+ * One call as a person writes it: an optional receiver, the name, an opening
+ * parenthesis.
+ *
+ * The receiver capture is deliberately one segment deep, and it is the segment
+ * nearest the call. In a.b.c() the call is on c and the object it was written on
+ * is b -- the one whose type decides what c is. Keeping the whole chain would
+ * store a string no resolver can use, and the leading capture exists so that a
+ * match is found without also matching the tail of a longer identifier.
+ */
+const CALL = /(^|[^\w$])(?:([A-Za-z_$][\w$]*)\s*\.\s*)?([A-Za-z_$][\w$]*)\s*\(/g;
+
+/** The word immediately before a match, to tell a declaration from a call. */
+const WORD_BEFORE = /([A-Za-z_$][\w$]*)\s*$/;
+
+/**
+ * The local declarations that give a receiver its type: var p: Player,
+ * p := Player.new(), const p = new Player(), p := &Player{}.
+ *
+ * Local by construction, which is why this can be settled while indexing: no
+ * other file can change what p is. Only type-shaped names are kept -- a receiver
+ * is a variable far more often than it is a type, and the uppercase convention
+ * is the only signal a regex has for telling them apart.
+ */
+const TYPE_RULES = {
+  gd: [
+    // The name-colon-Type annotation, wherever it is written: a var, an
+    // exported var, a function parameter, an @onready. It is the most common way
+    // a Godot project states a type, and a parameter is where a method call's
+    // receiver usually comes from.
+    /([A-Za-z_]\w*)\s*:\s*([A-Z]\w*)/,
+    /\bvar\s+([A-Za-z_]\w*)\s*(?::=|=)\s*([A-Za-z_]\w*)\s*\.\s*new\b/,
+  ],
+  py: [
+    // The same two shapes: an annotated name (parameter or local) and a
+    // constructor whose class name is right there.
+    /([A-Za-z_]\w*)\s*:\s*([A-Z]\w*)/,
+    /\b([A-Za-z_]\w*)\s*(?::\s*[A-Za-z_][\w.]*)?\s*=\s*([A-Z]\w*)\s*\(/,
+  ],
+  js: [
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)/,
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)/,
+  ],
+  go: [
+    /\bvar\s+([A-Za-z_]\w*)\s+\*?([A-Z]\w*)/,
+    /\b([A-Za-z_]\w*)\s*:=\s*&?([A-Z]\w*)\s*\{/,
+  ],
+  rs: [
+    /\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:\s*&?(?:mut\s+)?([A-Z]\w*)/,
+    /\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*=\s*&?([A-Z]\w*)\s*::/,
+  ],
+};
+
+/** The receivers whose type this file declares, as a variable-to-type map. */
+function declaredTypes(code, language) {
+  const rules = TYPE_RULES[language] ?? [];
+  const types = new Map();
+  for (const line of code) {
+    for (const rule of rules) {
+      const match = rule.exec(line);
+      if (match === null) continue;
+      if (/^[A-Z]/.test(match[2])) types.set(match[1], match[2]);
+      break;
+    }
+  }
+  return types;
+}
+
+/**
+ * The kinds whose body a call can sit in.
+ *
+ * A call written in the initializer of a variable is inside that variable's
+ * range, and naming the variable as the caller would be a small lie: nothing
+ * calls from a var. So only a declaration that can call anything is looked at,
+ * and a call outside all of them -- module level, or a const holding a function
+ * the line pass could not recognize as one -- is attributed to the file.
+ */
+const CALLABLE = new Set(["function", "method"]);
+
+/** The callable declaration a line sits inside: the innermost one covering it. */
+function enclosingName(symbols: IndexSymbol[], line: number): string | null {
+  let best: IndexSymbol | null = null;
+  for (const symbol of symbols) {
+    if (!CALLABLE.has(symbol.kind)) continue;
+    if (symbol.line > line || line > symbol.endLine) continue;
+    if (best === null || symbol.line >= best.line) best = symbol;
+  }
+  return best === null ? null : best.name;
+}
+
+/**
+ * Every call site in one file, each with the declaration it sits inside.
+ *
+ * What this deliberately does not do is decide what the name refers to. A file's
+ * calls are a local fact; which declaration answers them is not, and a table of
+ * stale resolutions is worse than no table at all.
+ *
+ * @param lines - the file's lines.
+ * @param language - from the index's language table; gdres files carry no calls.
+ * @param symbols - what the same file declared, for the enclosing declaration.
+ */
+export function collectCalls(lines, language, symbols: IndexSymbol[]): IndexCall[] {
+  if (language === "gdres") return [];
+  const code = codeOnly(lines, language);
+  const types = declaredTypes(code, language);
+  const calls: IndexCall[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < code.length; i += 1) {
+    const text = code[i];
+    if (text.indexOf("(") === -1) continue;
+    CALL.lastIndex = 0;
+    let match = CALL.exec(text);
+    while (match !== null) {
+      const before = WORD_BEFORE.exec(text.slice(0, match.index + match[1].length));
+      if (before !== null && DECLARED_AFTER.has(before[1])) {
+        match = CALL.exec(text);
+        continue;
+      }
+      let receiver = match[2] === undefined ? null : match[2];
+      let name = match[3];
+      if (KEYWORDS.has(name)) {
+        // Foo.new() is GDScript's constructor: what is being used is Foo.
+        if (name === "new" && receiver !== null && /^[A-Z]/.test(receiver)) {
+          name = receiver;
+          receiver = null;
+        } else {
+          match = CALL.exec(text);
+          continue;
+        }
+      }
+      const line = i + 1;
+      const key = line + " " + name + " " + (receiver === null ? "" : receiver);
+      if (seen.has(key)) {
+        match = CALL.exec(text);
+        continue;
+      }
+      seen.add(key);
+      calls.push({
+        name,
+        receiver,
+        receiverType: receiver === null ? null : SELF_RECEIVER.has(receiver) ? "self" : types.get(receiver) ?? null,
+        line,
+        caller: enclosingName(symbols, line),
+      });
+      match = CALL.exec(text);
+    }
+  }
+  return calls;
+}
+
 /**
  * Resolve one specifier against the index, in the importing file's own language.
  *
@@ -988,7 +1209,7 @@ function collectImports(lines, language) {
  * @param files - every indexed path.
  * @param byClassName - GDScript global name -> path, built once per ranking pass.
  */
-function resolveSpecifier(fromRel, spec, language, files, byClassName) {
+export function resolveSpecifier(fromRel, spec, language, files, byClassName) {
   if (spec.startsWith("res://")) {
     const target = posix.normalize(spec.slice("res://".length));
     return files[target] === undefined || files[target] === null ? null : target;

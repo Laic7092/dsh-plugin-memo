@@ -115,6 +115,10 @@ function schema(db) {
     "CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, bytes INTEGER, lines INTEGER, tokens INTEGER, mtime_ms REAL, language TEXT, description TEXT, sym_source TEXT, importance REAL, class_name TEXT)",
     "CREATE TABLE IF NOT EXISTS symbols (id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT, line INTEGER, end_line INTEGER)",
     "CREATE TABLE IF NOT EXISTS imports (file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, spec TEXT NOT NULL, target INTEGER)",
+    // What each file calls, as written. Deliberately not what it resolves to:
+    // that is a fact about the whole project, and a stored resolution goes
+    // stale in files nobody touched -- see calls.ts for the reasoning.
+    "CREATE TABLE IF NOT EXISTS calls (file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, name TEXT NOT NULL, receiver TEXT, receiver_type TEXT, line INTEGER, caller TEXT)",
     // Full text over what a file *is*, not only what it declares: the body is
     // what answers "where is this string", and it is the one thing the JSON
     // index could never afford to carry.
@@ -123,6 +127,8 @@ function schema(db) {
     "CREATE INDEX IF NOT EXISTS i_symbols_file ON symbols(file_id)",
     "CREATE INDEX IF NOT EXISTS i_imports_file ON imports(file_id)",
     "CREATE INDEX IF NOT EXISTS i_imports_target ON imports(target)",
+    "CREATE INDEX IF NOT EXISTS i_calls_name ON calls(name)",
+    "CREATE INDEX IF NOT EXISTS i_calls_file ON calls(file_id)",
   ].join(";\n"));
   db.exec("PRAGMA user_version = " + INDEX_VERSION);
 }
@@ -226,10 +232,15 @@ function insertEntry(db, root, rel, entry, statements, bodies) {
     symbols += 1;
   }
   for (const spec of entry.imports ?? []) statements.import.run(id, String(spec));
+  let calls = 0;
+  for (const call of entry.calls ?? []) {
+    statements.call.run(id, String(call.name), call.receiver ?? null, call.receiverType ?? null, Number(call.line ?? 0), call.caller ?? null);
+    calls += 1;
+  }
   // Unchanged files keep the body row they already have: a refresh must not
   // re-read a megabyte of sources to record that one file moved.
   statements.doc.run(rel, entry.description ?? "", bodies ? readBody(root, rel) : "");
-  return symbols;
+  return { symbols, calls };
 }
 
 function statementsFor(db) {
@@ -237,10 +248,37 @@ function statementsFor(db) {
     file: db.prepare("INSERT INTO files(path, bytes, lines, tokens, mtime_ms, language, description, sym_source, importance, class_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
     symbol: db.prepare("INSERT INTO symbols(file_id, name, kind, line, end_line) VALUES (?, ?, ?, ?, ?)"),
     import: db.prepare("INSERT INTO imports(file_id, spec, target) VALUES (?, ?, NULL)"),
+    call: db.prepare("INSERT INTO calls(file_id, name, receiver, receiver_type, line, caller) VALUES (?, ?, ?, ?, ?, ?)"),
     doc: db.prepare("INSERT INTO docs(path, description, body) VALUES (?, ?, ?)"),
     dropFile: db.prepare("DELETE FROM files WHERE path = ?"),
     dropDoc: db.prepare("DELETE FROM docs WHERE path = ?"),
   };
+}
+
+/**
+ * Drop the calls no declaration in the index answers for.
+ *
+ * A row is only worth keeping when some symbol somewhere carries its name: the
+ * table exists to answer "who calls this", and print( has no answer to give. The
+ * sweep covers the whole table because a refresh can take a name away -- rename
+ * the only declaration of foo and every call to foo in files nobody touched
+ * stops being an edge.
+ */
+function pruneCalls(db) {
+  try {
+    db.prepare("DELETE FROM calls WHERE name NOT IN (SELECT name FROM symbols)").run();
+  } catch {
+    // A table this version did not write is left exactly as it was found.
+  }
+}
+
+/** How many call rows the index holds, or 0 when that cannot be read. */
+function countCalls(db) {
+  try {
+    return Number(db.prepare("SELECT count(*) AS n FROM calls").get().n ?? 0);
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -257,11 +295,12 @@ export function writeIndex(db, index, options: { bodies?: boolean } = {}) {
   let symbols = 0;
   db.exec("BEGIN");
   try {
-    db.exec("DELETE FROM symbols; DELETE FROM imports; DELETE FROM docs; DELETE FROM files; DELETE FROM meta");
+    db.exec("DELETE FROM calls; DELETE FROM symbols; DELETE FROM imports; DELETE FROM docs; DELETE FROM files; DELETE FROM meta");
     for (const [rel, entry] of Object.entries(index.files ?? {})) {
-      symbols += insertEntry(db, index.root, rel, entry, statements, bodies);
+      symbols += insertEntry(db, index.root, rel, entry, statements, bodies).symbols;
     }
     writeMeta(db, index);
+    pruneCalls(db);
     db.exec("COMMIT");
   } catch (error) {
     try {
@@ -272,7 +311,7 @@ export function writeIndex(db, index, options: { bodies?: boolean } = {}) {
     throw error;
   }
   const files = Object.keys(index.files ?? {}).length;
-  return { files, symbols };
+  return { files, symbols, calls: countCalls(db) };
 }
 
 /**
@@ -301,9 +340,12 @@ export function syncIndex(db, index, diff: { added?: string[]; updated?: string[
       if (entry === undefined) continue;
       statements.dropFile.run(rel);
       statements.dropDoc.run(rel);
-      symbols += insertEntry(db, index.root, rel, entry, statements, bodies);
+      symbols += insertEntry(db, index.root, rel, entry, statements, bodies).symbols;
     }
     writeMeta(db, index);
+    // A file that was added can only add names, so only the other two shapes can
+    // make a stored call row stale.
+    if (removed.length > 0 || updated.length > 0) pruneCalls(db);
     db.exec("COMMIT");
   } catch (error) {
     try {
@@ -313,7 +355,7 @@ export function syncIndex(db, index, diff: { added?: string[]; updated?: string[
     }
     throw error;
   }
-  return { added: added.length, updated: updated.length, removed: removed.length, symbols };
+  return { added: added.length, updated: updated.length, removed: removed.length, symbols, calls: countCalls(db) };
 }
 
 function metaOf(db): Record<string, string> {
@@ -361,6 +403,7 @@ export function readIndex(db): MemoIndex | null {
       symbolSource: row.sym_source ?? "regex",
       importance: Number(row.importance ?? 0),
       imports: [],
+      calls: [],
       className: row.class_name ?? null,
     };
     files[row.path] = entry;
@@ -374,6 +417,20 @@ export function readIndex(db): MemoIndex | null {
   for (const row of db.prepare("SELECT file_id, spec FROM imports").all()) {
     const entry = byId.get(Number(row.file_id));
     if (entry !== undefined) entry.imports.push(row.spec);
+  }
+  // Read back like everything else: a caller holding this index can answer
+  // "who calls this" without going to the database again, and a refresh that
+  // reuses an unmoved file must not lose what that file calls.
+  for (const row of db.prepare("SELECT file_id, name, receiver, receiver_type, line, caller FROM calls ORDER BY file_id, line").all()) {
+    const entry = byId.get(Number(row.file_id));
+    if (entry === undefined) continue;
+    entry.calls.push({
+      name: row.name,
+      receiver: row.receiver ?? null,
+      receiverType: row.receiver_type ?? null,
+      line: Number(row.line ?? 0),
+      caller: row.caller ?? null,
+    });
   }
   const fileCount = Object.keys(files).length;
   return {
@@ -407,6 +464,8 @@ export function readIndexSummary(db) {
     root: meta.root ?? null,
     fileCount: files,
     symbolCount: symbols,
+    // The edges the index holds: what the answer to "who calls this" is made of.
+    callCount: countCalls(db),
     totalTokens,
     tokens: meta.tokens ?? "estimated",
     symbolSource: meta.symbolSource ?? "regex",

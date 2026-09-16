@@ -82,7 +82,7 @@ const textOutput = {
 const TOOL_DESCRIPTION = [
   "Read and write this project's memory in <project>/.memo/: STATUS.md (where the work stands, what is next, open questions, approaches already rejected), the append-only journal, the recorded-bug log, and a code index.",
   `Pass one command line — ${MEMO_COMMANDS.map((command) => command.name).join(" · ")}. Run 'memo status' first when resuming work, and 'memo help <command>' to see one command’s own flags. ${MEMO_COMMANDS.filter((command) => command.write).map((command) => command.name).join(", ")} WRITE to disk; the rest only read.`,
-  "Examples: 'status --notes 8' · 'find readTarget --budget 600' · \"handoff --now 'wiring the CLI' --next '- update README'\" · 'note decided to drop zod --kind decision' · 'bug-search EADDRINUSE' · \"bug-log --error 'ENOENT: no such file' --fix 'resolve before open'\".",
+  "Examples: 'status --notes 8' · 'find readTarget --budget 600' · 'find damage --callers 10' · \"handoff --now 'wiring the CLI' --next '- update README'\" · 'note decided to drop zod --kind decision' · 'bug-search EADDRINUSE' · \"bug-log --error 'ENOENT: no such file' --fix 'resolve before open'\".",
   "Every command takes --root PATH to point at another project; text with spaces goes in quotes.",
 ].join(" ");
 

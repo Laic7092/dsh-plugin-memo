@@ -34,7 +34,7 @@ memo status     [--notes N]                        读   四节 STATUS + 最近 
 memo handoff    [--now|--next|--open|--avoid T]    写   更新 STATUS.md，只替换传入的节
 memo note       TEXT [--kind note|decision|todo]   写   向 journal.jsonl 追加一行
 memo scan       [--exclude DIR]                    写   重建代码索引（本地 .memo/index.db）
-memo find       QUERY [--bodies N] [--full]        读   符号/路径/正文三处一起找；首个命中给正文
+memo find       QUERY [--bodies N] [--callers N]   读   符号/路径/正文三处一起找；首个命中给正文和调用点
 memo map        [FOCUS] [--budget N]               读   按目录汇总或聚焦主题
 memo bug-search TERM [--limit N]                   读   按症状检索历史修法，重复次数参与排序
 memo bug-log    --error T [--cause|--fix|…]        写   记一条修复，同症状累加次数
@@ -50,12 +50,16 @@ STATUS.md      现在在哪 / 下一步 / 未决问题 / 不要重犯
 journal.jsonl  append-only 动作日志，一行一个 JSON
 bugs.json      症状 → 原因 → 修法，同症状累加次数
 .gitignore     memo scan 建的：说明下面这份索引是本地缓存
-index.db       代码索引（memo scan 产出）——本地 SQLite，不进版本库
+index.db       代码索引（memo scan 产出）——本地 SQLite：文件、符号、import、调用点，不进版本库
 ```
 
 前三个是**记忆**：纯文本、可 diff、应当提交；写入是 tmp + rename，会写盘的子命令自动建目录。
 
 `index.db` 是**派生缓存**：里面每个字段都能从源码重建，所以它不进版本库——`memo scan` 会顺手写好 `.memo/.gitignore`（含 `index.db` 与 WAL 模式的两个旁文件）。新克隆或换机器后跑一次 `memo scan` 就有（600 文件约 0.6s）；直接 `memo find` 会明确让你先扫一次，而不是给你一份不知道多旧的答案。
+
+`calls` 表存的是**调用点本身**——名字、receiver、receiver 在同文件里声明的类型、行号、所在函数——而不是解析结果。某个名字属于哪个文件是全项目的事实，所以等有人问的时候再对着当时的符号表判：加一个文件不会让没动过的文件里的边变错，而增量刷新只写动过的那些行。名字在索引里没有任何声明的调用（`print(`、`preload(`）根本不记，这张表只回答关于索引内符号的问题。
+
+`memo find` 回答一个符号时会附上「谁调它」，每条都注明依据：本文件（词法作用域）、按类型（receiver 的类型或类名指向的文件）、全项目唯一（这个名字只在一个文件里声明）、按 import（同名多文件时，唯一被 import 的那个）。判不出来的不混进列表，单独计数：落在别的文件多少处、无法判定多少处。
 
 
 ## Memo 视图
@@ -79,6 +83,9 @@ index.db       代码索引（memo scan 产出）——本地 SQLite，不进版
 
 - `.gitignore` 只读“一行一个名字”的那部分（`lib/`、`build`、`*.min.js`）：带斜杠的锚定模式、`!` 反选和嵌套 `.gitignore` 不管，点开头的目录一律跳过。
 - `memo find` 默认只展开首个命中的正文（约 80 行封顶），预算 2000 tokens；要更多用 `--bodies N` 或 `--full`。
+- `memo find` 的调用点列表默认 6 条（`--callers N`，0 = 不列）；无法判定的调用只报数量、不列出来。
+- 调用点里把 GDScript 的 `Foo.new()` 记为对 `Foo` 的使用；但 `connect(..., _on_pressed)` 这种回调引用不算调用（引擎才会调它）。
+- receiver 的类型只从同一个文件里的 `name: Type` 注解和 `Foo.new()` / `new Foo()` 推断，不跟 `extends` 继承链：方法定义在基类、receiver 是子类类型时判不出来（计入「无法判定」）。
 - `refresh` 用同步 `statSync`；大项目嫌贵可设 `refresh: false`。
 - `exact` 首次计数要解析 6MB 词表（约 150ms），之后常驻内存；默认 `estimated`，两种单位不能混进同一份索引。
 - 索引需要 Node ≥ 22.5 的 `node:sqlite`。没有它的运行时里 `scan` / `find` / `map` 会说明原因，而 `status` / `handoff` / `note` / `bug-*` 照常工作——它们本来就是纯文本。

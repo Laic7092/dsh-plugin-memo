@@ -20,7 +20,24 @@ export interface IndexSymbol {
   endLine: number;
 }
 
-/** One file's entry in `.memo/index.json`. */
+/**
+ * One call site the indexer found in a file.
+ *
+ * What the file *calls*, not what the call means: the name as written, the
+ * receiver it was written on, that receiver's type when the same file declares
+ * one, and the declaration the call sits inside. Which file answers the name is
+ * a fact about the whole project and is decided when somebody asks -- see
+ * calls.ts.
+ */
+export interface IndexCall {
+  name: string;
+  receiver: string | null;
+  receiverType: string | null;
+  line: number;
+  caller: string | null;
+}
+
+/** One file's entry in the code index. */
 export interface IndexEntry {
   bytes: number;
   lines: number;
@@ -33,6 +50,8 @@ export interface IndexEntry {
   symbolSource: string;
   importance: number;
   imports: string[];
+  /** The calls this file makes, as written. */
+  calls: IndexCall[];
   /** GDScript's `class_name`, or null for every other language. */
   className: string | null;
 }

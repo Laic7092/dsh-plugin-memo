@@ -24,6 +24,7 @@
  */
 import { basename, resolve } from "node:path";
 import { appendBug, loadBugs, recentBugs, searchBugs } from "./bugs.ts";
+import { callersOf, sitesFor } from "./calls.ts";
 import { buildIndex, buildMap, costUnit, fileDetail, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "./indexer.ts";
 import { appendNote, readNotes } from "./journal.ts";
 import { patchStatus, readStatus, sectionBody, STATUS_SECTIONS, writeStatus } from "./status.ts";
@@ -46,6 +47,11 @@ const FIND_BUDGET = 2000;
 const FIND_BODY_LINES = 80;
 const FIND_CANDIDATES = 60;
 const FIND_TEXT = 5;
+/** How many callers the first symbol hit lists, and how they are grouped. */
+const FIND_CALLERS = 6;
+/** The reasons a call site was attributed, in the order the answer shows them. */
+const VIA_ORDER = ["self", "type", "only", "import"];
+const VIA_LABEL = { self: "本文件", type: "按类型", only: "全项目唯一", import: "按 import" };
 
 function lines(...parts) {
   return parts.filter((part) => typeof part === "string" && part.length > 0).join("\n");
@@ -135,9 +141,11 @@ function renderFileDetail(detail) {
  * body; a best answer with no body (a path hit) leaves the budget to the first
  * hit that has one.
  */
-function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number } = {}) {
+function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number; callers?: number; index?: MemoIndex | null } = {}) {
   const budget = Number.isFinite(options.budgetTokens) ? options.budgetTokens : FIND_BUDGET;
   const bodies = clampInt(options.bodies, 0, 8, 1);
+  const callers = clampInt(options.callers, 0, 50, FIND_CALLERS);
+  const index = options.index ?? null;
   if (result.files.length === 0 && result.text.length === 0) {
     return `索引里没有匹配 "${query}" 的符号、路径或正文（索引共 ${fmt(meta.fileCount)} 个文件，${fmt(meta.symbolCount)} 个符号）。`;
   }
@@ -162,6 +170,38 @@ function renderFind(query, result, meta, db, options: { budgetTokens?: number; b
     shown += 1;
     out.push(heading);
     if (file.description) out.push("    " + file.description);
+    // Who calls it, and before the body on purpose: whether the body needs
+    // reading at all depends on who is already calling it. This is the question
+    // a symbol index could not answer, and the calls table exists for it.
+    if (shown === 1 && file.symbol && callers > 0 && bodies > 0 && index !== null) {
+      const report = callersOf(sitesFor(index, file.symbol), index, { name: file.symbol, file: file.relPath }, { limit: callers });
+      if (report.total > 0) {
+        const resolved = VIA_ORDER.reduce((sum, via) => sum + (report.viaCounts[via] ?? 0), 0);
+        const parts = VIA_ORDER.filter((via) => (report.viaCounts[via] ?? 0) > 0).map((via) => VIA_LABEL[via] + " " + fmt(report.viaCounts[via]));
+        const head = "谁调它：" + fmt(resolved) + " 处调用点" + (parts.length > 0 ? "（" + parts.join(" · ") + "）" : "");
+        spent += counter(head) + 2;
+        out.push(head);
+        for (const caller of report.callers) {
+          const line = "  " + caller.relPath + ":" + caller.line + "  " + (caller.caller === null ? "(文件级)" : caller.caller);
+          const lineCost = counter(line) + 1;
+          if (spent + lineCost > budget) {
+            truncated = true;
+            break;
+          }
+          spent += lineCost;
+          out.push(line);
+        }
+        if (resolved > report.callers.length) out.push("    ... 还有 " + fmt(resolved - report.callers.length) + " 处，--callers 可以加");
+        const notes = [];
+        if (report.elsewhere > 0) notes.push(fmt(report.elsewhere) + " 处同名调用落在别的文件");
+        if (report.ambiguous > 0) {
+          notes.push(report.candidates.length > 1
+            ? fmt(report.ambiguous) + " 处无法判定（名字在 " + fmt(report.candidates.length) + " 个文件里都有，且没有类型或 import 线索）"
+            : fmt(report.ambiguous) + " 处无法判定");
+        }
+        if (notes.length > 0) out.push("    " + notes.join("；"));
+      }
+    }
     // The body, for the first hit that has one and no more unless asked.
     if (shown > bodies || !file.symbol) continue;
     const body = symbolBody(db, file.relPath, file.line, file.endLine, FIND_BODY_LINES);
@@ -250,11 +290,16 @@ function renderMap(map) {
   return `${out.join("\n").trimEnd()}\n`;
 }
 
-function renderScan(paths, index: MemoIndex, stale, durationMs) {
+function renderScan(paths, index: MemoIndex, stale, durationMs, written = null) {
   const meta = indexMeta(index);
+  // The rows the scan actually wrote, not the sites it found: a call whose name
+  // no declaration answers for is not stored, and this number is the table's.
+  const edges = written !== null && written.calls !== undefined
+    ? Number(written.calls)
+    : Object.values(index.files ?? {}).reduce((sum, file) => sum + (file.calls?.length ?? 0), 0);
   const out = [
     `已重建索引 · ${paths.db}`,
-    `${fmt(meta.fileCount)} 个文件 · ${fmt(meta.symbolCount)} 个符号 · ${tokenAmount(meta.totalTokens, meta.tokens)} · 用时 ${durationMs} ms`,
+    `${fmt(meta.fileCount)} 个文件 · ${fmt(meta.symbolCount)} 个符号 · ${fmt(edges)} 条调用边 · ${tokenAmount(meta.totalTokens, meta.tokens)} · 用时 ${durationMs} ms`,
     `符号来源：${index.symbolSource ?? "regex"}（tree-sitter 升级 ${TS_MIN_TOKENS} tokens 以上的文件；其余与失败回退都用行内启发式）`,
     "",
   ];
@@ -405,7 +450,8 @@ async function runFind(session, args) {
   const meta = indexMeta(session.index);
   const budget = clampInt(args.flags.budget, 100, 20000, FIND_BUDGET);
   const bodies = full ? 8 : args.flags.bodies === undefined ? 1 : clampInt(args.flags.bodies, 0, 8, 1);
-  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies }) };
+  const callers = args.flags.callers === undefined ? FIND_CALLERS : clampInt(args.flags.callers, 0, 50, FIND_CALLERS);
+  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies, callers, index: session.index }) };
 }
 
 //#endregion
@@ -597,7 +643,7 @@ export const MEMO_COMMANDS = [
     group: "index",
     write: true,
     usage: "scan [--exclude DIR]",
-    summary: "重建代码索引 .memo/index.db（本地 SQLite）：文件、行数、tokens、开头注释当描述、符号+行范围、import 图排名",
+    summary: "重建代码索引 .memo/index.db（本地 SQLite）：文件、行数、tokens、开头注释当描述、符号+行范围、调用点、import 图排名",
     flags: { exclude: { kind: "list", hint: "DIR", description: "额外跳过的目录名，可重复；叠加在内置表之上" } },
     async run(ctx, args) {
       const started = Date.now();
@@ -610,28 +656,29 @@ export const MEMO_COMMANDS = [
       const paths = createMemoDir(memoPaths(ctx.project.root, ctx.state.dirName));
       const opened = await openIndexDb(paths, { create: true, log: ctx.log });
       if (!opened.ok) return { ok: false, text: opened.error };
+      let written = null;
       try {
-        writeIndex(opened.db, index);
+        written = writeIndex(opened.db, index);
       } catch (error) {
         return { ok: false, text: "写 " + paths.db + " 失败：" + (error && error.message ? error.message : String(error)) };
       } finally {
         closeDb(opened.db);
       }
-      return renderScan(paths, index, staleFiles(index, 5), Date.now() - started);
+      return renderScan(paths, index, staleFiles(index, 5), Date.now() - started, written);
     },
   },
   {
     name: "find",
     group: "index",
     write: false,
-    usage: "find QUERY [--file PATH] [--budget N] [--bodies N] [--full]",
-    summary: "在索引里定位符号/路径/正文：给行号，首个命中给正文；回答前自动复核索引"
-    ,
+    usage: "find QUERY [--file PATH] [--budget N] [--bodies N] [--callers N] [--full]",
+    summary: "在索引里定位符号/路径/正文：给行号，首个命中给正文和调用点；回答前自动复核索引",
     flags: {
       file: { kind: "string", hint: "PATH", description: "改成一个具体文件：给它的描述和符号行范围" },
       budget: { kind: "int", hint: "N", description: "答案的 token 预算（默认 2000）" },
       bodies: { kind: "int", hint: "N", description: "展开几个命中的正文（默认 1；0 = 只要行号）" },
       full: { kind: "bool", description: "展开每个有正文的命中（等于 --bodies 8）" },
+      callers: { kind: "int", hint: "N", description: "首个命中的符号列几个调用点（默认 6；0 = 不列）" },
     },
     async run(ctx, args) {
       const paths = memoPaths(ctx.project.root, ctx.state.dirName);

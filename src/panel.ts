@@ -77,6 +77,7 @@ async function indexView(paths) {
       scannedAt: meta.scannedAt,
       fileCount: meta.fileCount,
       symbolCount: meta.symbolCount,
+      callCount: meta.callCount,
       totalTokens: meta.totalTokens,
       // Which counter produced that total. Without it the panel has a number
       // and no idea whether it is a measurement or a guess.

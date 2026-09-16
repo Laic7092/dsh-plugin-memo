@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -256,5 +256,28 @@ test("the catalogue, the help text and the commands themselves are one list", ()
     assert.equal(typeof command.run, "function");
     // The word the tool description and the help page both lean on.
     assert.equal(typeof command.write, "boolean");
+  }
+});
+
+test("find says who calls the symbol it answers about", async () => {
+  const root = mkdtempSync(join(tmpdir(), "memo-cli-calls-"));
+  mkdirSync(join(root, "src"), { recursive: true });
+  writeFileSync(join(root, "src", "core.ts"), "export function alpha() { return 1 }\n", "utf8");
+  writeFileSync(join(root, "src", "use.ts"), 'import { alpha } from "./core";\nexport function run() { return alpha(); }\n', "utf8");
+  try {
+    // The scan counts the edges it stored, which is the same number the answer
+    // is made of.
+    assert.match((await cli(root, "scan")).text, /1 条调用边/);
+
+    const found = await cli(root, "find alpha");
+    assert.match(found.text, /谁调它：1 处调用点（全项目唯一 1）/);
+    assert.match(found.text, /src\/use\.ts:2 {2}run/, "the caller, the line, and the declaration it sits in");
+
+    // The flag is a switch, not a hint: off means the section is not there.
+    const off = await cli(root, "find alpha --callers 0");
+    assert.doesNotMatch(off.text, /谁调它/);
+    assert.match(off.text, /src\/core\.ts:1-1/, "the answer itself is unchanged");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

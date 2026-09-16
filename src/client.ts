@@ -320,6 +320,7 @@
 						{ className: "memoGrid", key: "grid" },
 						field("文件", num(index.fileCount)),
 						field("符号", num(index.symbolCount)),
+						field("调用边", num(index.callCount)),
 						field(index.tokens === "exact" ? "精确 tokens" : "估算 tokens", num(index.totalTokens)),
 						field("符号来源", index.symbolSource),
 						field("建立于", index.scannedAt || "-"),
@@ -506,7 +507,7 @@
 				setNotice(null);
 				ask("/memo/scan", { root: root, method: "POST" })
 					.then((body) => {
-						setNotice(`索引已重建：${num(body.index.fileCount)} 个文件 · ${num(body.index.symbolCount)} 个符号 · ${body.durationMs} ms`);
+						setNotice(`索引已重建：${num(body.index.fileCount)} 个文件 · ${num(body.index.symbolCount)} 个符号 · ${num(body.index.callCount)} 条调用边 · ${body.durationMs} ms`);
 						return ask("/memo/state", { root: root }).then((state) => setData(state));
 					})
 					.catch((failure) => setError(failure.message))
