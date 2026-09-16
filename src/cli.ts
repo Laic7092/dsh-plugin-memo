@@ -27,6 +27,22 @@ import { appendBug, loadBugs, recentBugs, searchBugs } from "./bugs.ts";
 import { callersOf, sitesFor } from "./calls.ts";
 import { buildIndex, buildMap, costUnit, fileDetail, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "./indexer.ts";
 import { appendNote, readNotes } from "./journal.ts";
+
+/**
+ * How long one journal entry may be.
+ *
+ * The journal is read back to the model -- `memo status` prints the recent ones
+ * on every resume -- so an entry is context the next session pays for. A note
+ * that restates a commit, a STATUS line or the conversation it came from is
+ * that cost and no benefit; what is worth keeping is the one line nobody else
+ * holds: the measurement that changed a plan, the approach that turned out to
+ * be a dead end, the thing the next session would otherwise redo.
+ *
+ * A decision gets more room, because a decision without its constraint and its
+ * rejected alternative is not a record of a decision, it is a headline.
+ */
+const NOTE_CHARS = 200;
+const DECISION_CHARS = 400;
 import { patchStatus, readStatus, sectionBody, STATUS_SECTIONS, writeStatus } from "./status.ts";
 import { clampInt, createMemoDir, findProjectRoot, isFile, memoPaths, stamp, statOrNull } from "./store.ts";
 import { closeDb, findInDb, indexDbStat, openIndexDb, readIndex, syncIndex, writeIndex } from "./db.ts";
@@ -645,14 +661,30 @@ export const MEMO_COMMANDS = [
     group: "memory",
     write: true,
     usage: "note TEXT [--kind note|decision|todo]",
-    summary: "往 journal.jsonl 追加一行：做过的决定、走过的路",
-    flags: { kind: { kind: "string", hint: "KIND", description: "条目类型：note / decision / todo（默认 note）" } },
+    summary: "往 journal.jsonl 追加一行；一条一句，note " + NOTE_CHARS + " 字 / decision " + DECISION_CHARS + " 字封顶——这些行每次恢复都会被读出来",
+    flags: { kind: { kind: "string", hint: "KIND", description: "条目类型：note / decision / todo（默认 note）；decision 的 400 字预算给约束和否决的方案" } },
     run(ctx, args) {
       const text = phrase(args.rest);
       if (text.length === 0) return { ok: false, text: "note 需要一句话：memo note <text> [--kind decision]" };
+      // The budget is enforced, not advised: the reader of this file is the next
+      // session, and it reads every recent line on every resume.
+      const kind = args.flags.kind ?? "note";
+      const budget = kind === "decision" ? DECISION_CHARS : NOTE_CHARS;
+      if (text.length > budget) {
+        return {
+          ok: false,
+          text: lines(
+            `这一条 ${text.length} 字，上限 ${budget} 字（--kind ${kind}）——写不进去。`,
+            "",
+            "journal 是给下一个会话读的：memo status 每次恢复都会把这些行打出来。压缩它，或者换个容器：",
+            "  · 只留接下来那个人要用的一句：数字、结论、哪条路试过不行；",
+            "  · 已经提交的写提交号，不要把 diff 复述一遍；",
+            "  · 要留下的现状写 memo handoff，长报告放别处（提交信息、issue、README）。",
+          ),
+        };
+      }
       const paths = createMemoDir(memoPaths(ctx.project.root, ctx.state.dirName));
       const at = stamp();
-      const kind = args.flags.kind ?? "note";
       const write = appendNote(paths, { at, session: ctx.session, kind, text });
       if (!write.ok) return { ok: false, text: "写 " + paths.journal + " 失败：" + write.error };
       const notes = readNotes(paths, 1);

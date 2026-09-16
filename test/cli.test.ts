@@ -91,6 +91,27 @@ test("a spelled-out newline becomes one, and other backslashes are left alone", 
   }
 });
 
+test("a note that is a report gets refused, and nothing is created for it", async () => {
+  // The journal is read back on every resume, so an entry is standing context.
+  // A long one is not a bigger memory, it is a tax on every later session --
+  // and the refusal has to say where that text belongs instead.
+  const root = scratch();
+  try {
+    const long = "长".repeat(201);
+    const refused = await cli(root, `note ${long}`);
+    assert.equal(refused.ok, false);
+    assert.match(refused.text, /上限 200 字/);
+    assert.match(refused.text, /memo handoff/, "the refusal names the right container");
+    assert.equal(readdirSync(root).includes(".memo"), false, "a refusal creates no memo directory");
+
+    // A decision is allowed the room its reasoning needs -- but not more.
+    assert.equal((await cli(root, `note ${"决".repeat(399)} --kind decision`)).ok, true);
+    assert.match((await cli(root, `note ${"决".repeat(401)} --kind decision`)).text, /上限 400 字/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a bare line is the status, and handoff feeds it", async () => {
   const root = scratch();
   try {

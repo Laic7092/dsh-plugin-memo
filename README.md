@@ -47,7 +47,7 @@ memo help       [子命令]                            读   语法与全部选�
 
 ```
 STATUS.md      现在在哪 / 下一步 / 未决问题 / 不要重犯
-journal.jsonl  append-only 动作日志，一行一个 JSON
+journal.jsonl  append-only 动作日志，一行一个 JSON；一条一句（note 200 字 / decision 400 字封顶），因为 memo status 每次恢复都会把它读回模型
 bugs.json      症状 → 原因 → 修法，同症状累加次数
 .gitignore     memo scan 建的：说明下面这份索引是本地缓存
 index.db       代码索引（memo scan 产出）——本地 SQLite：文件、符号、import、调用点，不进版本库

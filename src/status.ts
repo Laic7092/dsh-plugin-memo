@@ -18,7 +18,7 @@ export function statusTemplate(projectName, at = stamp()) {
   const lines = [
     `# STATUS — ${projectName}`,
     "",
-    "> 单一事实来源：接手先读这里，一个阶段结束时用 `memo handoff` 覆写下面四节。写短——这一页是给下一个会话扫的，来龙去脉留在代码、测试和 git log 里。",
+    "> 单一事实来源：接手先读这里，一个阶段结束时用 `memo handoff` 覆写下面四节。写短——这一页是给下一个会话扫的，来龙去脉留在代码、测试和 git log 里。journal 更短：一条一句，只放别人手里没有的那句（数字、结论、哪条路试过不行）。",
     "",
     `_最后更新：${at}_`,
   ];
