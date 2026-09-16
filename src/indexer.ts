@@ -48,8 +48,13 @@ export interface BudgetOptions {
  * was built with `tokenizer: "exact"`, and the index says which of the two it
  * is in `tokens`. A refresh whose counter differs from the stamp rebuilds,
  * because a reused entry would otherwise keep a count from the other unit.
+ *
+ * 5 moved the index out of \`index.json\` and into a local SQLite database
+ * (\`./db.ts\`). The rows carry the same fields, so extraction and ranking did
+ * not change -- but the medium did, and an index written in the old one cannot
+ * be read from the new one, which is exactly what a version is for.
  */
-export const INDEX_VERSION = 4;
+export const INDEX_VERSION = 5;
 export const DEFAULT_EXCLUDES = [
   "node_modules", ".git", ".memo", "dist", "build", "out", "target", "vendor",
   ".venv", "venv", "__pycache__", ".next", ".nuxt", ".cache", "coverage", ".idea", ".vscode",
@@ -122,13 +127,25 @@ const RULES = {
 
 const IMPORT_PATTERNS: Record<string, RegExp[]> = {
   js: [/from\s+["']([^"']+)["']/g, /(?:require|import)\s*\(\s*["']([^"']+)["']\s*\)/g, /^\s*import\s+["']([^"']+)["']/gm],
-  py: [/^\s*from\s+([.\w]+)\s+import/gm, /^\s*import\s+([.\w]+)/gm],
-  go: [],
-  rs: [],
+  // Two shapes only: `from x import ...` (which is also the relative form,
+  // `from .util import x`) and a bare `import a, b`. A dotted absolute name is
+  // resolved from the project root, the same way the interpreter's own search
+  // path starts there — see {@link moduleCandidates}.
+  py: [/^\s*from\s+([.\w]+)\s+import\b/gm, /^\s*import\s+([.\w]+)/gm],
+  // One import path per line inside a block, and the quoted path otherwise.
+  // A Go import path carries no extension and is rooted at the module, so the
+  // last segment is a directory name (vendor/... included).
+  go: [/^\s*import\s+(?:[.\w]+\s+)?["`]([^"`]+)["`]/gm, /^\s*(?:[.\w]+\s+)?["`]([^"`]+)["`]\s*$/gm],
+  // `use a::b::{c, d}` is kept whole: the resolver trims the brace list, and
+  // the stem search below no longer needs `mod x;` to find a module file.
+  rs: [/^\s*use\s+([^;]+);/gm],
 };
 
-IMPORT_PATTERNS.go = [];
-IMPORT_PATTERNS.rs = [];
+/** The token an import statement puts the name in. */
+function aliasFree(spec) {
+  const at = spec.search(/\s+as\s+/);
+  return (at === -1 ? spec : spec.slice(0, at)).trim().replace(/[",;]+$/, "");
+}
 /**
  * GDScript dependencies. `res://` is kept in the capture so
  * {@link resolveSpecifier} can tell a project path from a global class name;
@@ -191,10 +208,10 @@ function countingMode(index: MemoIndex): TokenMode | null {
 /**
  * The cost of one shortlist hit, in the same unit the index was built in. A
  * hit's cost is a string this module makes up (`path Name`), so it is measured
- * with whichever counter produced the counts being spent against — spending a
+ * with whichever counter produced the counts being spent against -- spending a
  * budget of exact tokens with a rough estimate of the hits would drift.
  */
-function costUnit(tokens: TokenMode): (text: string) => number {
+export function costUnit(tokens: TokenMode): (text: string) => number {
   return tokens === "exact" ? exactTokens : estimateTokens;
 }
 
@@ -250,13 +267,84 @@ function stripHashComment(line) {
 const HASH_COMMENT = new Set(["py", "gd"]);
 
 /**
- * A file's lines joined with its own comment style removed, for import
- * scanning. Without this a commented-out line is a dependency: `# preload(...)`
- * and `# import os` both used to become edges that no code ever had.
+ * The languages whose comments are the slash kind: two slashes to the end of
+ * the line, or a slash-star pair closed by its mirror.
+ *
+ * Named rather than assumed: {@link stripLine} neutralizes string literals on its
+ * way to the comments, which is exactly wrong for the two formats whose
+ * dependencies *are* string literals — Godot's `preload("res://...")` and the
+ * `ext_resource path="..."` rows of a scene. Those keep their literals and lose
+ * nothing, because neither language has a `//` comment to strip.
+ */
+const SLASH_COMMENT = new Set(["js", "go", "rs"]);
+
+/** The doc for commentFree is below, next to the code it explains. */
+/**
+ * A file's lines joined with its own comments removed, for import scanning.
+ *
+ * Deliberately string-preserving where the older {@link stripHash} is not: the
+ * patterns below read import specifiers *out of* string literals, so a pass that
+ * neutralized strings on the way to the comments would delete exactly what is
+ * being looked for. It did, once: `from "./auth"` became `from ""` and every
+ * JavaScript import edge vanished while the suite stayed green. Comments go,
+ * literals stay, and `#` languages keep their own reader for the same reason.
  */
 function commentFree(lines, language) {
   const body = HASH_COMMENT.has(language) ? lines.map(stripHashComment) : lines;
-  return body.join("\n");
+  const joined = body.join(String.fromCharCode(10));
+  return SLASH_COMMENT.has(language) ? stripComments(joined, false) : joined;
+}
+
+/**
+ * Remove `//` and block comments from a whole file, leaving strings intact.
+ *
+ * One scan over the text rather than one regex per line, because the two things
+ * this must not confuse are the ones a line-at-a-time pass cannot tell apart: a
+ * `//` inside a string is not a comment, and a `/* *` + `/` that opens on one line
+ * and closes on another is a comment that a per-line pass would leave standing.
+ * The closing marker is written as `*` + `/` here for the same reason this whole
+ * function exists -- prose about comment syntax is still prose.
+ *
+ * @param text - the file, lines joined with newlines.
+ * @param neutralize - when true, string contents are replaced with empty
+ *   quotations. Off for import scanning (the specifier *is* the string) and on
+ *   for the declaration pass, which wants a literal to stop looking like code.
+ */
+export function stripComments(text: string, neutralize: boolean): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === "/" && next === "/") {
+      while (i < text.length && text[i] !== String.fromCharCode(10)) i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const close = text.indexOf("*" + "/", i + 2);
+      i = close === -1 ? text.length : close + 2;
+      continue;
+    }
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      const quote = ch;
+      let j = i + 1;
+      while (j < text.length) {
+        if (text[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (text[j] === quote) break;
+        j += 1;
+      }
+      if (neutralize) out += quote + quote;
+      else out += text.slice(i, Math.min(j + 1, text.length));
+      i = j + 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
 }
 
 /** The line where a brace-delimited body closes, or the declaration line. */
@@ -475,7 +563,58 @@ function describe(lines) {
   return collected.length === 0 ? null : collected.join(" ").slice(0, 200);
 }
 
-function walk(root, excludes, files, depth = 0) {
+/**
+ * The names a project's own `.gitignore` says are not source, as a set to skip.
+ *
+ * Deliberately narrow: this reads the plain names out of the file -- `lib/`,
+ * `build`, `*.min.js` -- and ignores everything that would need git's matching
+ * rules to get right (globs with slashes, negations, nested `.gitignore` files).
+ * The point is the ordinary case that keeps biting: a directory the project
+ * itself calls generated, which the built-in table does not know about and which
+ * nothing else will remind anyone of. A name ignored by mistake costs an entry
+ * in the index; a name *not* ignored by mistake costs the ranking, because a
+ * vendored tree's symbols and imports drown out the project's own.
+ *
+ * Returns an empty set when there is no file, which is every test fixture and
+ * most scratch directories.
+ */
+function gitignoredNames(root) {
+  const names = new Set();
+  let text;
+  try {
+    text = readFileSync(join(root, ".gitignore"), "utf8");
+  } catch {
+    return names;
+  }
+  for (const raw of String(text).split(String.fromCharCode(10))) {
+    const line = raw.trim();
+    if (line.length === 0 || line.startsWith("#") || line.startsWith("!")) continue;
+    // A pattern with a slash is anchored somewhere this does not model; the
+    // basename form is the one worth having.
+    if (line.slice(0, -1).includes("/")) continue;
+    const name = line.replace(/\/$/, "");
+    if (name.length === 0 || name === "." || name === "..") continue;
+    names.add(name);
+  }
+  return names;
+}
+
+/**
+ * Whether a directory or file name is one the project itself ignores.
+ *
+ * `*.min.js` is matched as the suffix it is, a bare name as exactly itself, and
+ * a name with a `*` anywhere else is left alone rather than guessed at.
+ */
+function ignoredName(name, ignored) {
+  if (ignored.size === 0) return false;
+  if (ignored.has(name)) return true;
+  for (const pattern of ignored) {
+    if (pattern.startsWith("*") && name.endsWith(pattern.slice(1))) return true;
+  }
+  return false;
+}
+
+function walk(root, excludes, ignored, files, depth = 0) {
   if (files.length >= MAX_FILES || depth > 24) return;
   let entries;
   try {
@@ -492,10 +631,12 @@ function walk(root, excludes, files, depth = 0) {
     const full = join(root, entry.name);
     if (entry.isDirectory()) {
       if (excludes.has(entry.name)) continue;
-      walk(full, excludes, files, depth + 1);
+      if (ignoredName(entry.name, ignored)) continue;
+      walk(full, excludes, ignored, files, depth + 1);
       continue;
     }
     if (!entry.isFile()) continue;
+    if (ignoredName(entry.name, ignored)) continue;
     const language = LANGUAGE[extname(entry.name)];
     if (language === undefined) continue;
     files.push({ full, language, ext: extname(entry.name).toLowerCase() });
@@ -620,7 +761,7 @@ export async function buildIndex(root: string, options: IndexOptions = {}): Prom
   const analyzer = options.analyzer ?? null;
   const counter = resolveTokenCounter(options, options.log);
   const found: Array<{ full: string; language: string; ext: string }> = [];
-  walk(resolved, excludes, found);
+  walk(resolved, excludes, gitignoredNames(resolved), found);
 
   const files: Record<string, IndexEntry> = {};
   for (const { full, language, ext } of found) {
@@ -719,7 +860,7 @@ export async function refreshIndex(index: MemoIndex, options: IndexOptions = {})
 
   const excludes = new Set([...DEFAULT_EXCLUDES, ...requested]);
   const found: Array<{ full: string; language: string; ext: string }> = [];
-  walk(root, excludes, found);
+  walk(root, excludes, gitignoredNames(root), found);
 
   const previous: Record<string, IndexEntry> = index.files ?? {};
   const files: Record<string, IndexEntry> = {};
@@ -807,38 +948,229 @@ function collectImports(lines, language) {
   for (const pattern of IMPORT_PATTERNS[language] ?? []) {
     pattern.lastIndex = 0;
     let match;
-    while ((match = pattern.exec(text)) !== null) specs.add(match[1]);
+    while ((match = pattern.exec(text)) !== null) {
+      // One statement can name several modules — Python's `import a, b`, Go's
+      // block form. Every language that spells it that way separates the names
+      // with a comma, and none of the path-shaped ones may contain one.
+      for (const part of String(match[1]).split(",")) {
+        const spec = aliasFree(part);
+        if (spec.length > 0) specs.add(spec);
+      }
+    }
   }
   return [...specs];
 }
 
 /**
- * Resolve one specifier against the index.
+ * Resolve one specifier against the index, in the importing file's own language.
  *
- * Three shapes reach here: a `res://` project path (Godot, always carrying its
- * extension), a relative path (JS/TS/Python/Go/Rust), and a bare identifier —
- * which is only ever a GDScript global class name, because no other indexed
- * language refers to a sibling file by a name the file itself declares.
+ * Four shapes reach here:
+ *
+ *  - a `res://` project path (Godot, always carrying its extension);
+ *  - a relative path -- `./auth`, `../pkg/mod`, Python's `from .util import x`,
+ *    where the leading dots are the whole notation and carry no slashes;
+ *  - an absolute module name -- Python's `from app.models import User`, Go's
+ *    `example.com/x/pkg`, Rust's `crate::a::b` -- rooted at the project (Python)
+ *    or the crate (Rust), and for Go naming a *directory* whose package is what
+ *    the file imports;
+ *  - a bare identifier, which is only ever a GDScript global class name, because
+ *    no other indexed language refers to a sibling file by a name the file
+ *    itself declares.
+ *
+ * Every one of these is resolved *against the index*: nothing is invented, an
+ * ambiguous or unseen target yields null, and a language this index cannot
+ * resolve contributes no edge at all. The ranking is what the answer feeds, and
+ * a wrong edge is worse there than a missing one.
+ *
+ * @param fromRel - the importing file, project-relative with "/" separators.
+ * @param spec - the specifier as the source spelled it.
+ * @param language - the importing file's language, from the index entry.
+ * @param files - every indexed path.
+ * @param byClassName - GDScript global name -> path, built once per ranking pass.
  */
-function resolveSpecifier(fromRel, spec, files, byClassName) {
+function resolveSpecifier(fromRel, spec, language, files, byClassName) {
   if (spec.startsWith("res://")) {
     const target = posix.normalize(spec.slice("res://".length));
-    if (files[target] !== undefined) return target;
-    return null;
+    return files[target] === undefined || files[target] === null ? null : target;
   }
-  if (spec.startsWith(".")) {
-    const base = posix.dirname(fromRel);
-    const target = posix.normalize(posix.join(base === "." ? "" : base, spec));
-    const candidates = [
-      target, `${target}.ts`, `${target}.tsx`, `${target}.js`, `${target}.jsx`, `${target}.mjs`, `${target}.cjs`,
-      `${target}.py`, `${target}.go`, `${target}.rs`, `${target}.gd`, `${target}.tscn`, `${target}.tres`,
-      `${target}/index.ts`, `${target}/index.js`,
-    ];
-    for (const candidate of candidates) if (files[candidate] !== undefined) return candidate;
-    return null;
+  if (spec.startsWith(".") && (language === "js" || language === "gd")) {
+    return matchFile(jsCandidates(fromRel, spec), files);
   }
+  if (language === "py") {
+    // A single dot is `from . import x` -- a level, not a path segment. More
+    // than one is a parent traversal, and the notation is the same either way.
+    const dots = /^\.+/.exec(spec);
+    if (dots !== null) {
+      const parents = dots[0].length - 1;
+      const base = posix.dirname(fromRel);
+      const up = parents === 0 ? base : posix.normalize(posix.join(base, ...Array(parents).fill("..")));
+      const head = up === "." ? "" : up;
+      const parts = spec.slice(dots[0].length).split(".").filter((part) => part.length > 0);
+      // A list that empties out here means "the package itself", which is a
+      // directory; the import names a module inside it.
+      if (parts.length === 0) return null;
+      return matchFile([posix.join(head, ...parts)], files);
+    }
+    return matchFile(partsFor(spec), files);
+  }
+  if (language === "go") return matchFile(goCandidates(spec), files);
+  if (language === "rs") return matchFile(rustCandidates(fromRel, spec, files), files);
+  if (files[spec] !== undefined && files[spec] !== null) return spec;
   return byClassName !== undefined && byClassName.has(spec) ? byClassName.get(spec) : null;
 }
+
+/** A relative path run through the extension/index table: the JS and Godot rule. */
+function jsCandidates(fromRel, spec) {
+  const base = posix.dirname(fromRel);
+  const target = posix.normalize(posix.join(base === "." ? "" : base, spec));
+  return [
+    target,
+    ...EXTENSIONS.map((ext) => target + ext),
+    ...EXTENSIONS.map((ext) => posix.join(target, "index" + ext)),
+    ...EXTENSIONS.map((ext) => posix.join(target, "__init__" + ext)),
+  ];
+}
+
+/** Dots to slashes: Python's absolute form, rooted where a run from the root is. */
+function partsFor(spec) {
+  return spec.split(".").filter((part) => part.length > 0);
+}
+
+/** Escape a literal so it can stand inside a regular expression. */
+function literal(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The path a bare module stem names, whichever file or package carries it. */
+function stemToPath(stem) {
+  return "^(?:.*/)?" + literal(stem) + "(?:\\.\\w+|/__init__\\.py)$";
+}
+
+/**
+ * Go import paths name a directory, and the package inside it is matched by
+ * *file*, never by module path -- so the last segment is the directory and any
+ * file in it is the answer.
+ *
+ * `example.com/x/pkg`, `x/pkg` and `pkg` all bottom out the same way, which
+ * is also what makes a `vendor/`-nested dependency resolve: the vendored copy
+ * is an indexed directory with that name, and the module path above it is not in
+ * the index at all.
+ */
+function goCandidates(spec) {
+  const segments = String(spec).split("/").filter((part) => part.length > 0);
+  const last = segments.length > 0 ? segments[segments.length - 1] : "";
+  const out = [];
+  if (last.length > 0 && !last.includes(".")) out.push("^(?:.*/)?" + literal(last) + "/[^/]+\\.go$");
+  if (last.length > 0) out.push(stemToPath(last));
+  return out;
+}
+
+/**
+ * Rust paths bottom out at a module file, and how the path is rooted depends on
+ * the shape of the crate: a `src/` layout, or `main.rs`/`lib.rs` at the root.
+ *
+ * `crate::`, `self::` and `super::` are relative to the importing module's own
+ * path, so they are resolved by *shape* -- the segments after the keyword,
+ * joined -- which lands on `a/b/mod.rs` as readily as on `a/b.rs`. Everything
+ * else is an absolute path from a crate root, or a module stem.
+ */
+function rustCandidates(fromRel, spec, files) {
+  const clean = String(spec).split("{")[0].trim().replace(/::$/, "");
+  if (clean.length === 0) return [];
+  if (clean === "crate" || clean.startsWith("crate::")) {
+    const rest = clean === "crate" ? "" : clean.slice("crate::".length);
+    return packageCandidates(partsOf(rest));
+  }
+  if (clean === "self" || clean.startsWith("self::")) {
+    const rest = clean === "self" ? "" : clean.slice("self::".length);
+    return packageCandidates(partsOf(rest));
+  }
+  if (clean === "super" || clean.startsWith("super::")) {
+    const rest = clean === "super" ? "" : clean.slice("super::".length);
+    const base = posix.dirname(fromRel);
+    // From a module file, `super` is the package above it; from a crate root it
+    // is the directory the file lives in.
+    const dir = posix.basename(base) === "src" ? base : posix.dirname(base);
+    const head = dir === "." ? "" : dir;
+    return packageCandidates(partsOf(rest).map((part) => posix.join(head, part)));
+  }
+  return matchSpecs([stemToPath(clean), ...packageCandidates(partsOf(clean))], files);
+}
+
+/** `a::b::c` as path segments; a `*` glob is not a path. */
+function partsOf(spec) {
+  return String(spec)
+    .split("::")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0 && part !== "*");
+}
+
+/** Every file path a module path could mean: the module file, or the directory's own. */
+function packageCandidates(segments) {
+  if (segments.length === 0) return [];
+  const joined = posix.join(...segments);
+  return [
+    ...EXTENSIONS.map((ext) => joined + ext),
+    ...EXTENSIONS.map((ext) => posix.join(joined, "mod" + ext)),
+    ...EXTENSIONS.map((ext) => posix.join(joined, "lib" + ext)),
+    ...EXTENSIONS.map((ext) => posix.join(joined, "main" + ext)),
+    ...EXTENSIONS.map((ext) => posix.join(joined, "__init__" + ext)),
+  ];
+}
+
+/**
+ * The one file a candidate list names, or null.
+ *
+ * A list mixes exact paths -- which decide on the spot -- with patterns that
+ * stand for a package or a module stem and can match several files. Patterns are
+ * ranked by shape (the module file itself, then a directory's `mod`/`__init__`,
+ * then a same-named file anywhere) and an outright tie is a miss rather than a
+ * coin flip: the edge is only worth having if the index knows which file it goes
+ * to.
+ */
+function matchFile(candidates, files) {
+  const patterns = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate.length === 0) continue;
+    if (files[candidate] !== undefined && files[candidate] !== null) return candidate;
+    patterns.push("^" + literal(candidate) + "$");
+  }
+  return matchSpecs(patterns, files);
+}
+
+/** The winning path for a group of patterns, or null when they name several. */
+function matchSpecs(patterns, files) {
+  if (patterns.length === 0) return null;
+  const hits = new Map();
+  for (let rank = 0; rank < patterns.length; rank++) {
+    let re;
+    try {
+      re = new RegExp(patterns[rank]);
+    } catch {
+      continue;
+    }
+    for (const rel of Object.keys(files)) {
+      if (files[rel] === undefined || files[rel] === null) continue;
+      if (hits.has(rel) && hits.get(rel).rank <= rank) continue;
+      if (re.test(rel)) hits.set(rel, { rel, rank });
+    }
+  }
+  if (hits.size === 0) return null;
+  let best = null;
+  for (const hit of hits.values()) if (best === null || hit.rank < best) best = hit.rank;
+  let found = null;
+  let seen = 0;
+  for (const hit of hits.values()) {
+    if (hit.rank === best) {
+      seen += 1;
+      found = hit.rel;
+    }
+  }
+  return seen === 1 ? found : null;
+}
+
+/** Extensions a relative specifier may leave implicit, in the order tried. */
+const EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".gd", ".tscn", ".tres"];
 
 /** Personalized PageRank over the import graph, normalized to 0..1. */
 function rankByImportance(files: Record<string, IndexEntry>) {
@@ -853,8 +1185,9 @@ function rankByImportance(files: Record<string, IndexEntry>) {
   }
   const out = new Map(names.map((name) => [name, []]));
   for (const name of names) {
-    for (const spec of files[name].imports ?? []) {
-      const target = resolveSpecifier(name, spec, files, byClassName);
+    const entry = files[name];
+    for (const spec of entry.imports ?? []) {
+      const target = resolveSpecifier(name, spec, entry.language, files, byClassName);
       if (target !== null) out.get(name).push(target);
     }
   }
@@ -878,9 +1211,16 @@ function rankByImportance(files: Record<string, IndexEntry>) {
     for (const name of names) next.set(name, next.get(name) + spread);
     rank = next;
   }
-  const max = Math.max(...rank.values());
+  // Normalized against the mean, not the maximum. PageRank on a real project is
+  // flat -- half the files are imported by nobody -- so scaling by the top score
+  // hands them all the same 1.0 and the bonus this feeds stops telling anything
+  // apart, which is exactly what a ranking signal must not do. Against the mean
+  // an ordinary file sits near 1, an unimported one below it, and a hub well
+  // above, and the number means the same thing from project to project.
+  const total = [...rank.values()].reduce((sum, value) => sum + value, 0);
+  const mean = names.length > 0 ? total / names.length : 0;
   for (const name of names) {
-    files[name].importance = max > 0 ? Number((rank.get(name) / max).toFixed(4)) : 0;
+    files[name].importance = mean > 0 ? Number((rank.get(name) / mean).toFixed(4)) : 0;
   }
 }
 

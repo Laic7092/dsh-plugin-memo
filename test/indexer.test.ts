@@ -76,13 +76,58 @@ test("importance follows the import graph", async () => {
     const server = index.files["src/server.ts"].importance;
     assert.ok(auth > 0, "an imported file carries rank");
     assert.ok(auth >= server, "the imported file outranks its importer");
-    assert.ok(auth <= 1 && server >= 0);
+    // The scale is "the average file is 1", not "the top file is 1": scaling by
+    // the maximum flattened a real project to a single value -- every file at
+    // exactly 1.0, so the bonus this feeds ranked nothing.
+    assert.ok(auth > 1, "the imported file is above the mean");
+    assert.ok(server < 1, "a file nothing imports is below it");
     assert.equal(indexMeta(index).symbolCount, 4);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
 
+test("a comment goes, and the import next to it stays", async () => {
+  const base = mkdtempSync(join(tmpdir(), "memo-comment-"));
+  try {
+    // Every one of these has bitten: a comment stripper that neutralizes string
+    // literals on its way to the comments deletes the specifier it is looking
+    // for, and one that works a line at a time leaves a block comment standing.
+    writeFileSync(join(base, "a.ts"), [
+      '// import { gone } from "./ghost";',
+      'import { kept } from "./b";',
+      'const url = "https://example.com/x"; // not a comment, and not an import',
+      "/* a block comment",
+      '   import { alsoGone } from "./ghost2"; */',
+      "export function a() { return url; }",
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(join(base, "b.ts"), "export function kept() {}\n", "utf8");
+    const index = await buildIndex(base);
+    assert.deepEqual(index.files["a.ts"].imports, ["./b"], "the live specifier survives, and only it");
+    assert.ok(index.files["b.ts"].importance > index.files["a.ts"].importance, "the edge is real enough to rank");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("a project's own .gitignore keeps generated trees out of the index", async () => {
+  const base = mkdtempSync(join(tmpdir(), "memo-gitignore-"));
+  try {
+    mkdirSync(join(base, "lib"), { recursive: true });
+    mkdirSync(join(base, "src"), { recursive: true });
+    mkdirSync(join(base, "anchored"), { recursive: true });
+    writeFileSync(join(base, ".gitignore"), ["node_modules/", "lib/", "*.min.js", "!keep.min.js", "# a comment", "/anchored/"].join("\n") + "\n", "utf8");
+    writeFileSync(join(base, "lib", "built.js"), "export function built() {}\n", "utf8");
+    writeFileSync(join(base, "src", "app.js"), "export function app() {}\n", "utf8");
+    writeFileSync(join(base, "vendor.min.js"), "export function min() {}\n", "utf8");
+    writeFileSync(join(base, "anchored", "deep.js"), "export function deep() {}\n", "utf8");
+    const index = await buildIndex(base);
+    assert.deepEqual(Object.keys(index.files).sort(), ["anchored/deep.js", "src/app.js"], "a plain name and a suffix pattern are honoured; an anchored or negated one is left alone rather than guessed at");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
 test("findInIndex ranks an exact symbol above a path hit and respects the budget", async () => {
   const base = fixture();
   try {
@@ -306,11 +351,20 @@ test("tree-sitter replaces the guesses where a grammar exists", async (t) => {
     for (const expected of ["Widget", "Widget.constructor", "Widget.render", "Widget.update", "Widget.make", "Widget.handle"]) {
       assert.ok(names.includes(expected), `tree-sitter must find ${expected}`);
     }
-    // A plain constant is not a symbol: the declarator's value is not a function.
+    // A module-level constant *is* a declaration — it is what other files
+    // import — so the grammar keeps it, and only the function's insides are
+    // left out. The rule used to be "a declarator is a symbol only when its
+    // value is a function", which silently dropped every other export.
     const source = `${WIDGET}\nexport const MAX_WIDGETS = 32;\n${FILLER}\n`;
     writeFileSync(join(base, "widget.js"), source, "utf8");
     const again = await buildIndex(base, { analyzer });
-    assert.equal(again.files["widget.js"].symbols.some((symbol) => symbol.name === "MAX_WIDGETS"), false);
+    const constants = again.files["widget.js"].symbols.filter((symbol) => symbol.kind === "const");
+    assert.deepEqual(constants.map((symbol) => symbol.name), ["MAX_WIDGETS"]);
+    assert.deepEqual(constants.map((symbol) => symbol.line), [source.split("\n").findIndex((line) => line.includes("MAX_WIDGETS")) + 1]);
+    // Nothing from inside a body: locals are not declarations this index owes
+    // anyone, and `FILLER` holds plenty of them.
+    assert.equal(again.files["widget.js"].symbols.some((symbol) => symbol.name === "Widget.render"), true);
+    assert.equal(again.files["widget.js"].symbols.some((symbol) => symbol.line > source.split("\n").length), false);
 
     // Below the threshold the file keeps its line-based symbols.
     assert.equal(index.files["tiny.js"].symbolSource, "regex");

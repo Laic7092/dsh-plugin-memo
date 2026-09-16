@@ -679,7 +679,7 @@ test("the settings panel routes answer JSON, and the write route is guarded", { 
   }
 });
 
-test("a big index is read whole instead of being cut off mid-JSON", { skip }, async () => {
+test("a big index is not cut off by the cap that guards the memory files", { skip }, async () => {
   const base = scratchProject();
   try {
     const fake = fakeContext();
@@ -687,21 +687,19 @@ test("a big index is read whole instead of being cut off mid-JSON", { skip }, as
     const exec = agentIn(base);
     const run = (command) => fake.tools.get("memo").execute({ command }, exec);
 
-    writeFileSync(join(base, "a.ts"), "export function alpha() {}\n", "utf8");
-    await run("scan");
-
-    // A real repository's index passes 400 KB without trying; pad this one past
-    // the per-file read cap, which is not the cap the index is read under.
-    const indexFile = join(base, ".memo", "index.json");
-    const index = JSON.parse(readFileSync(indexFile, "utf8"));
-    index.descriptionPad = "x".repeat(500_000);
-    writeFileSync(indexFile, JSON.stringify(index, null, 2), "utf8");
-    assert.ok(readFileSync(indexFile).length > 400_000);
+    // Past the 400 KB per-file read cap the memory files are read under, and
+    // past what the old JSON index carried comfortably. Neither cap is the
+    // index's any more: a database reads rows, not one document, so a large
+    // project cannot be silently truncated into a smaller answer.
+    writeFileSync(join(base, "a.ts"), "export function alpha() {}\n// " + "x".repeat(500_000) + "\n", "utf8");
+    writeFileSync(join(base, "b.ts"), "export function beta() {}\n", "utf8");
+    assert.match(await run("scan"), /已重建索引/);
 
     const found = await run("find alpha");
-    assert.doesNotMatch(found, /is not valid JSON/);
     assert.match(found, /a\.ts/);
-    assert.doesNotMatch(await run("map"), /没有可用的代码索引/);
+    assert.doesNotMatch(found, /is not valid JSON/);
+    assert.match(await run("find beta"), /b\.ts/, "the second file is in the same index");
+    assert.match(await run("map"), /项目地图/);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

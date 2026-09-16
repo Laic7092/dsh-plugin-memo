@@ -99,7 +99,9 @@ test("every command writes the same files the tools used to", async () => {
     assert.match((await cli(root, "bug-search EADDRINUSE")).text, /先 kill/);
     assert.match((await cli(root, "status")).text, /改用 zod 解析配置/);
 
-    assert.deepEqual(readdirSync(join(root, ".memo")).sort(), ["bugs.json", "index.json", "journal.jsonl"]);
+    // The index is a local database now, and the memory directory carries its
+    // own .gitignore saying so: the plain-text files are the part worth keeping.
+    assert.deepEqual(readdirSync(join(root, ".memo")).sort(), [".gitignore", "bugs.json", "index.db", "journal.jsonl"]);
     const bug = JSON.parse(readFileSync(join(root, ".memo", "bugs.json"), "utf8"));
     assert.equal(bug.bugs.length, 1, "one symptom is one entry, however it was spelled");
     assert.equal(bug.bugs[0].occurrences, 2);

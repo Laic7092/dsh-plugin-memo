@@ -24,13 +24,28 @@
  */
 import { basename, resolve } from "node:path";
 import { appendBug, loadBugs, recentBugs, searchBugs } from "./bugs.ts";
-import { buildIndex, buildMap, fileDetail, findInIndex, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "./indexer.ts";
+import { buildIndex, buildMap, costUnit, fileDetail, indexMeta, refreshIndex, staleFiles, TS_MIN_TOKENS } from "./indexer.ts";
 import { appendNote, readNotes } from "./journal.ts";
 import { patchStatus, readStatus, sectionBody, STATUS_SECTIONS, writeStatus } from "./status.ts";
-import { INDEX_MAX_BYTES, clampInt, createMemoDir, findProjectRoot, isFile, memoPaths, readJson, stamp, statOrNull, writeJsonAtomic } from "./store.ts";
+import { clampInt, createMemoDir, findProjectRoot, isFile, memoPaths, stamp, statOrNull } from "./store.ts";
+import { closeDb, findInDb, indexDbStat, openIndexDb, readIndex, syncIndex, writeIndex } from "./db.ts";
 import type { MemoIndex, MemoState } from "./types.ts";
 
 const fmt = (n) => Number(n ?? 0).toLocaleString("en-US");
+
+/**
+ * What a `memo find` answer is allowed to cost, and what it spends it on.
+ *
+ * The budget covers the whole answer, bodies included, because the point of a
+ * budget is the cost of the turn. One body by default: the first hit is the best
+ * answer, and a reader who needs a second one asks for it -- `--bodies`, or the
+ * file itself. The caps below are the shape of the shortlist rather than its
+ * price: the price is the budget, always.
+ */
+const FIND_BUDGET = 2000;
+const FIND_BODY_LINES = 80;
+const FIND_CANDIDATES = 60;
+const FIND_TEXT = 5;
 
 function lines(...parts) {
   return parts.filter((part) => typeof part === "string" && part.length > 0).join("\n");
@@ -71,10 +86,10 @@ function renderStatusText(project, paths, status, notes, bugs) {
     if (bug.fix) out.push(`      fix: ${bug.fix}`);
   }
 
-  const indexStat = statOrNull(paths.index);
+  const indexStat = indexDbStat(paths);
   out.push(indexStat === null
     ? "代码索引：还没建（memo scan 会建）"
-    : `代码索引：${fmt(indexStat.size)} 字节，改于 ${new Date(indexStat.mtimeMs).toISOString()}`);
+    : `代码索引：${fmt(indexStat.bytes)} 字节，改于 ${new Date(indexStat.mtimeMs).toISOString()}`);
 
   out.push("", notes.present ? `最近动作（${notes.notes.length}/${notes.total} 条）` : "最近动作：还没有");
   for (const note of notes.notes) out.push(`  ${note.at}  [${note.kind}]  ${note.text}`);
@@ -108,19 +123,109 @@ function renderFileDetail(detail) {
   return `${out.join("\n").trimEnd()}\n`;
 }
 
-function renderFind(query, result, meta) {
-  if (result.matches.length === 0) {
-    return `索引里没有匹配 "${query}" 的符号或路径（索引共 ${fmt(meta.fileCount)} 个文件，${fmt(meta.symbolCount)} 个符号）。`;
+
+/**
+ * `memo find` as a reader takes it: the shortlist, then the bodies behind the
+ * first hit and behind whatever the shortlist could not name.
+ *
+ * The shortlist is cheap -- a path, a kind, a line range -- and the bodies are
+ * not, so exactly one of them is spent by default. That is the shape a reader
+ * actually needs: enough to know where to look, and one readable copy of the
+ * thing itself. The first hit is the best answer, so it is the one that gets a
+ * body; a best answer with no body (a path hit) leaves the budget to the first
+ * hit that has one.
+ */
+function renderFind(query, result, meta, db, options: { budgetTokens?: number; bodies?: number } = {}) {
+  const budget = Number.isFinite(options.budgetTokens) ? options.budgetTokens : FIND_BUDGET;
+  const bodies = clampInt(options.bodies, 0, 8, 1);
+  if (result.files.length === 0 && result.text.length === 0) {
+    return `索引里没有匹配 "${query}" 的符号、路径或正文（索引共 ${fmt(meta.fileCount)} 个文件，${fmt(meta.symbolCount)} 个符号）。`;
   }
-  const out = [
-    `匹配 "${query}" · ${result.matches.length}/${fmt(result.total)} 条 · 约 ${fmt(result.spent)}/${fmt(result.budget)} tokens${result.truncated ? "（被预算截断）" : ""}`,
-    "",
-  ];
-  for (const match of result.matches) {
-    out.push(`${match.line}  ${match.kind}${match.symbol ? " " + match.symbol.name : ""}  [${match.importance.toFixed(2)}]`);
-    if (match.description) out.push(`    ${match.description}`);
+  const unit = meta.tokens === "exact" ? "exact" : "estimated";
+  const counter = costUnit(unit);
+  let spent = 0;
+  let shown = 0;
+  let truncated = false;
+  const out = [];
+  for (const file of result.files) {
+    const heading = [
+      file.symbol ? `${file.relPath}:${file.line}-${file.endLine}` : file.relPath,
+      file.kind + (file.symbol ? " " + file.symbol : ""),
+      `[${Number(file.importance ?? 0).toFixed(2)}]`,
+    ].join("  ");
+    const cost = counter(heading) + 2;
+    if (spent + cost > budget && shown > 0) {
+      truncated = true;
+      break;
+    }
+    spent += cost;
+    shown += 1;
+    out.push(heading);
+    if (file.description) out.push("    " + file.description);
+    // The body, for the first hit that has one and no more unless asked.
+    if (shown > bodies || !file.symbol) continue;
+    const body = symbolBody(db, file.relPath, file.line, file.endLine, FIND_BODY_LINES);
+    if (body === null) continue;
+    const bodyCost = counter(body.text) + 2;
+    if (spent + bodyCost > budget) {
+      truncated = true;
+      continue;
+    }
+    spent += bodyCost;
+    // The range is already in the heading above; the body speaks for itself.
+    out.push(body.text);
+    if (body.more > 0) out.push(`    ... 还有 ${body.more} 行，用 --full 或 --file ${file.relPath}`);
   }
-  return `${out.join("\n").trimEnd()}\n`;
+  for (const hit of result.text) {
+    out.push(`${hit.relPath}:${hit.line}  正文命中`);
+    for (const excerpt of hit.excerpt) out.push("    " + excerpt);
+  }
+  const head = [
+    `索引命中 ${fmt(result.total)} 个文件 · 列出 ${fmt(shown)} 个 · ${tokenAmount(spent, unit)}/${fmt(budget)}`,
+    result.text.length > 0 ? `${result.text.length} 处正文命中` : "",
+    truncated ? "被预算截断，--budget 可加" : "",
+  ].filter((part) => part.length > 0).join(" · ");
+  return `${[head, "", ...out].join(String.fromCharCode(10)).trimEnd()}${String.fromCharCode(10)}`;
+}
+
+/**
+ * A symbol's own lines, as a reader takes them.
+ *
+ * The body has been in the database since the index moved there -- it is what
+ * makes "where is this string" answerable -- and this is the other half of that
+ * purchase: the lines a symbol names, read back for the one hit worth reading.
+ * A symbol is capped so one enormous function cannot spend the whole answer.
+ */
+function symbolBody(db, relPath, startLine, endLine, maxLines) {
+  const first = Math.max(1, Number(startLine) || 1);
+  const last = Math.max(first, Number(endLine) || first);
+  const lines = readFileLines(db, relPath, first, Math.min(last, first + maxLines - 1));
+  if (lines.length === 0) return null;
+  return {
+    range: `${relPath}:${first}-${Math.min(last, first + maxLines - 1)}`,
+    text: lines.join(String.fromCharCode(10)),
+    more: Math.max(0, last - (first + maxLines - 1)),
+  };
+}
+
+/**
+ * Lines `from`..`to` of a stored body, inclusive and 1-based.
+ *
+ * Read from the database rather than the disk: the body already passed the size
+ * and binary checks when the scan stored it, and a file that vanished since is
+ * still answerable -- with what the index last saw, which is the honest answer
+ * for an index.
+ */
+function readFileLines(db, relPath, from, to) {
+  let row = null;
+  try {
+    row = db.prepare("SELECT body FROM docs WHERE path = ?").get(relPath);
+  } catch {
+    return [];
+  }
+  const body = row === null || row === undefined ? null : row.body;
+  if (typeof body !== "string" || body.length === 0) return [];
+  return body.split(String.fromCharCode(10)).slice(from - 1, to);
 }
 
 function renderMap(map) {
@@ -148,11 +253,14 @@ function renderMap(map) {
 function renderScan(paths, index: MemoIndex, stale, durationMs) {
   const meta = indexMeta(index);
   const out = [
-    `已重建索引 · ${paths.index}`,
+    `已重建索引 · ${paths.db}`,
     `${fmt(meta.fileCount)} 个文件 · ${fmt(meta.symbolCount)} 个符号 · ${tokenAmount(meta.totalTokens, meta.tokens)} · 用时 ${durationMs} ms`,
     `符号来源：${index.symbolSource ?? "regex"}（tree-sitter 升级 ${TS_MIN_TOKENS} tokens 以上的文件；其余与失败回退都用行内启发式）`,
     "",
   ];
+  if (isFile(paths.index)) {
+    out.push("旧的 index.json 还在（已经不再读写）：删掉它即可；如果它被提交过，用 git rm --cached .memo/index.json 取消跟踪。");
+  }
   if (stale.changedCount > 0 || stale.missingCount > 0) {
     out.push(`索引落后于磁盘：${stale.changedCount} 个文件改过、${stale.missingCount} 个已消失。`);
     for (const rel of stale.changed.slice(0, 5)) out.push(`  改过  ${rel}`);
@@ -195,19 +303,74 @@ function withSync(text, sync) {
 
 //#region the index — read side
 
-function loadIndex(paths) {
-  if (!isFile(paths.index)) return { ok: false, index: null, error: `${paths.index} 还不存在——先跑 memo scan` };
-  const stat = statOrNull(paths.index);
-  if (stat !== null && stat.size > INDEX_MAX_BYTES) {
-    return { ok: false, index: null, error: "index.json 大得不正常，重新跑一次 memo scan" };
+/**
+ * An index session: the index, what the automatic revalidation did, and the
+ * handle that closes the database when the answer is written.
+ *
+ * One transaction, not one helper per command: the read commands all need the
+ * same three things, and the refresh has to happen on the same connection the
+ * query then runs on. Closing is the caller's -- a command waits until its text
+ * exists before it lets go of the database.
+ */
+async function openIndexSession(paths, state, analyzer) {
+  const opened = await openIndexDb(paths);
+  if (!opened.ok) return { ok: false, db: null, index: null, sync: null, error: opened.error };
+  let index = readIndex(opened.db);
+  if (index === null) {
+    closeDb(opened.db);
+    return { ok: false, db: null, index: null, sync: null, error: paths.db + " 读不出内容——重新跑一次 memo scan" };
   }
-  const file = readJson(paths.index, null, INDEX_MAX_BYTES);
-  if (!file.ok) return { ok: false, index: null, error: file.error };
-  const value = file.value;
-  if (!value || typeof value !== "object" || typeof value.files !== "object" || value.files === null) {
-    return { ok: false, index: null, error: "index.json 的形状看不懂——重新跑一次 memo scan" };
+  if (!state.refresh) return { ok: true, db: opened.db, index, sync: null, error: null };
+  let fresh;
+  try {
+    fresh = await refreshIndex(index, { exclude: state.exclude, analyzer, tokenizer: state.tokenizer });
+  } catch (error) {
+    // A refresh that throws must not cost the caller its answer: hand back the
+    // index we have and say plainly that it may be behind.
+    const failed = error && error.message ? error.message : String(error);
+    return { ok: true, db: opened.db, index, sync: { failed }, error: null };
   }
-  return { ok: true, index: value, error: null };
+  let sync = fresh;
+  if (fresh.changed > 0) {
+    const write = await writeRefresh(paths, fresh);
+    // Answer from memory either way; only the on-disk copy is at stake.
+    if (!write.ok) sync = { ...fresh, writeError: write.error };
+  }
+  return { ok: true, db: opened.db, index: fresh.index, sync, error: null };
+}
+
+async function loadIndex(paths) {
+  const opened = await openIndexDb(paths);
+  if (!opened.ok) return { ok: false, index: null, error: opened.error };
+  try {
+    const index = readIndex(opened.db);
+    if (index === null) return { ok: false, index: null, error: paths.db + " 读不出内容——重新跑一次 memo scan" };
+    return { ok: true, index, error: null };
+  } finally {
+    closeDb(opened.db);
+  }
+}
+
+/**
+ * Put a refresh's findings back on disk.
+ *
+ * Only what the sweep found is written: a rebuilt index writes everything, a
+ * patch writes the three lists. Bodies are re-read for whatever is written and
+ * for nothing else, which is what keeps a refresh proportional to the edit
+ * rather than to the project.
+ */
+async function writeRefresh(paths, fresh) {
+  const opened = await openIndexDb(paths, { create: true });
+  if (!opened.ok) return { ok: false, error: opened.error };
+  try {
+    if (fresh.rebuilt === true) writeIndex(opened.db, fresh.index);
+    else syncIndex(opened.db, fresh.index, { added: fresh.added, updated: fresh.updated, removed: fresh.removed });
+    return { ok: true, error: null };
+  } catch (error) {
+    return { ok: false, error: error && error.message ? error.message : String(error) };
+  } finally {
+    closeDb(opened.db);
+  }
 }
 
 /**
@@ -219,23 +382,30 @@ function loadIndex(paths) {
  * do not go through the harness at all. See `refreshIndex` for what the sweep
  * costs and why it is stronger than a write hook.
  */
-async function openIndex(paths, state, analyzer) {
-  const loaded = loadIndex(paths);
-  if (!loaded.ok || !state.refresh) return { ...loaded, sync: null };
-  let fresh;
-  try {
-    fresh = await refreshIndex(loaded.index, { exclude: state.exclude, analyzer, tokenizer: state.tokenizer });
-  } catch (error) {
-    // A refresh that throws must not cost the caller its answer: hand back the
-    // index we have and say plainly that it may be behind.
-    return { ...loaded, sync: { failed: error && error.message ? error.message : String(error) } };
+
+/**
+ * The query half of `memo find`, on an open session.
+ *
+ * Everything it needs comes from SQL: the shortlist, the first hit's body, and
+ * the excerpts behind a phrase that only appears in the text. The in-memory
+ * index is read only for its counts -- the answer has to say how big the haystack
+ * was -- which is why this is a few queries rather than a reconstruction.
+ */
+async function runFind(session, args) {
+  const file = typeof args.flags.file === "string" ? args.flags.file.trim() : "";
+  if (file.length > 0) {
+    const detail = fileDetail(session.index, file);
+    if (detail === null) return { ok: false, text: `索引里没有 ${file}。重新跑 memo scan，或者直接用 grep/read。` };
+    return { ok: true, text: renderFileDetail(detail) };
   }
-  if (fresh.changed > 0) {
-    const write = writeJsonAtomic(paths.index, fresh.index);
-    // Answer from memory either way; only the on-disk copy is at stake.
-    if (!write.ok) return { ok: true, index: fresh.index, error: null, sync: { ...fresh, writeError: write.error } };
-  }
-  return { ok: true, index: fresh.index, error: null, sync: fresh };
+  const query = phrase(args.rest);
+  if (query.length === 0) return { ok: false, text: "find 需要 query（符号名、路径片段，或正文里的任意词），或者 --file 一个具体路径" };
+  const full = args.flags.full === true;
+  const result = findInDb(session.db, query, { limit: FIND_CANDIDATES, textLimit: FIND_TEXT });
+  const meta = indexMeta(session.index);
+  const budget = clampInt(args.flags.budget, 100, 20000, FIND_BUDGET);
+  const bodies = full ? 8 : args.flags.bodies === undefined ? 1 : clampInt(args.flags.bodies, 0, 8, 1);
+  return { ok: true, text: renderFind(query, result, meta, session.db, { budgetTokens: budget, bodies }) };
 }
 
 //#endregion
@@ -416,10 +586,10 @@ export const MEMO_COMMANDS = [
       const at = stamp();
       const kind = args.flags.kind ?? "note";
       const write = appendNote(paths, { at, session: ctx.session, kind, text });
-      if (!write.ok) return { ok: false, text: `写 ${paths.journal} 失败：${write.error}` };
+      if (!write.ok) return { ok: false, text: "写 " + paths.journal + " 失败：" + write.error };
       const notes = readNotes(paths, 1);
       const total = notes.present ? notes.total : 1;
-      return `已记录（journal 共 ${total} 条）：${at}  [${kind}]  ${text}`;
+      return "已记录（journal 共 " + total + " 条）：" + at + "  [" + kind + "]  " + text;
     },
   },
   {
@@ -427,7 +597,7 @@ export const MEMO_COMMANDS = [
     group: "index",
     write: true,
     usage: "scan [--exclude DIR]",
-    summary: "重建代码索引 index.json：文件、行数、tokens、开头注释当描述、符号+行范围、import 图排名",
+    summary: "重建代码索引 .memo/index.db（本地 SQLite）：文件、行数、tokens、开头注释当描述、符号+行范围、import 图排名",
     flags: { exclude: { kind: "list", hint: "DIR", description: "额外跳过的目录名，可重复；叠加在内置表之上" } },
     async run(ctx, args) {
       const started = Date.now();
@@ -438,8 +608,15 @@ export const MEMO_COMMANDS = [
         log: ctx.log,
       });
       const paths = createMemoDir(memoPaths(ctx.project.root, ctx.state.dirName));
-      const write = writeJsonAtomic(paths.index, index);
-      if (!write.ok) return { ok: false, text: `写 ${paths.index} 失败：${write.error}` };
+      const opened = await openIndexDb(paths, { create: true, log: ctx.log });
+      if (!opened.ok) return { ok: false, text: opened.error };
+      try {
+        writeIndex(opened.db, index);
+      } catch (error) {
+        return { ok: false, text: "写 " + paths.db + " 失败：" + (error && error.message ? error.message : String(error)) };
+      } finally {
+        closeDb(opened.db);
+      }
       return renderScan(paths, index, staleFiles(index, 5), Date.now() - started);
     },
   },
@@ -447,26 +624,27 @@ export const MEMO_COMMANDS = [
     name: "find",
     group: "index",
     write: false,
-    usage: "find QUERY [--budget N]",
-    summary: "按符号/路径在索引里定位到行号；回答前自动复核索引",
+    usage: "find QUERY [--file PATH] [--budget N] [--bodies N] [--full]",
+    summary: "在索引里定位符号/路径/正文：给行号，首个命中给正文；回答前自动复核索引"
+    ,
     flags: {
       file: { kind: "string", hint: "PATH", description: "改成一个具体文件：给它的描述和符号行范围" },
-      budget: { kind: "int", hint: "N", description: "短名单的 token 预算（默认 1000）" },
+      budget: { kind: "int", hint: "N", description: "答案的 token 预算（默认 2000）" },
+      bodies: { kind: "int", hint: "N", description: "展开几个命中的正文（默认 1；0 = 只要行号）" },
+      full: { kind: "bool", description: "展开每个有正文的命中（等于 --bodies 8）" },
     },
     async run(ctx, args) {
       const paths = memoPaths(ctx.project.root, ctx.state.dirName);
-      const loaded = await openIndex(paths, ctx.state, ctx.analyzer);
-      if (!loaded.ok) return { ok: false, text: `没有可用的代码索引：${loaded.error}` };
-      const file = typeof args.flags.file === "string" ? args.flags.file.trim() : "";
-      if (file.length > 0) {
-        const detail = fileDetail(loaded.index, file);
-        if (detail === null) return { ok: false, text: `索引里没有 ${file}。重新跑 memo scan，或者直接用 grep/read。` };
-        return withSync(renderFileDetail(detail), loaded.sync);
+      const session = await openIndexSession(paths, ctx.state, ctx.analyzer);
+      if (!session.ok) return { ok: false, text: `没有可用的代码索引：${session.error}` };
+      try {
+        const answer = await runFind(session, args);
+        // A refusal is already worded for the caller; only an answer gets the
+        // automatic-sync line appended.
+        return answer.ok ? { ok: true, text: withSync(answer.text, session.sync) } : answer;
+      } finally {
+        closeDb(session.db);
       }
-      const query = phrase(args.rest);
-      if (query.length === 0) return { ok: false, text: "find 需要 query（符号名或路径片段），或者 --file 一个具体路径" };
-      const result = findInIndex(loaded.index, query, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1000) });
-      return withSync(renderFind(query, result, indexMeta(loaded.index)), loaded.sync);
     },
   },
   {
@@ -478,10 +656,14 @@ export const MEMO_COMMANDS = [
     flags: { budget: { kind: "int", hint: "N", description: "token 预算（默认 1200）" } },
     async run(ctx, args) {
       const paths = memoPaths(ctx.project.root, ctx.state.dirName);
-      const loaded = await openIndex(paths, ctx.state, ctx.analyzer);
-      if (!loaded.ok) return { ok: false, text: `没有可用的代码索引：${loaded.error}` };
-      const map = buildMap(loaded.index, phrase(args.rest) || undefined, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1200) });
-      return withSync(renderMap(map), loaded.sync);
+      const session = await openIndexSession(paths, ctx.state, ctx.analyzer);
+      if (!session.ok) return { ok: false, text: `没有可用的代码索引：${session.error}` };
+      try {
+        const map = buildMap(session.index, phrase(args.rest) || undefined, { budgetTokens: clampInt(args.flags.budget, 100, 8000, 1200) });
+        return withSync(renderMap(map), session.sync);
+      } finally {
+        closeDb(session.db);
+      }
     },
   },
   {

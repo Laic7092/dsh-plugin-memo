@@ -33,8 +33,8 @@ allowBuilds:
 memo status     [--notes N]                        读   四节 STATUS + 最近 journal + bug 数 + 索引状态
 memo handoff    [--now|--next|--open|--avoid T]    写   更新 STATUS.md，只替换传入的节
 memo note       TEXT [--kind note|decision|todo]   写   向 journal.jsonl 追加一行
-memo scan       [--exclude DIR]                    写   重建代码索引
-memo find       QUERY [--budget N]                 读   按符号/路径定位到行号，先复核索引
+memo scan       [--exclude DIR]                    写   重建代码索引（本地 .memo/index.db）
+memo find       QUERY [--bodies N] [--full]        读   符号/路径/正文三处一起找；首个命中给正文
 memo map        [FOCUS] [--budget N]               读   按目录汇总或聚焦主题
 memo bug-search TERM [--limit N]                   读   按症状检索历史修法，重复次数参与排序
 memo bug-log    --error T [--cause|--fix|…]        写   记一条修复，同症状累加次数
@@ -49,10 +49,14 @@ memo help       [子命令]                            读   语法与全部选�
 STATUS.md      现在在哪 / 下一步 / 未决问题 / 不要重犯
 journal.jsonl  append-only 动作日志，一行一个 JSON
 bugs.json      症状 → 原因 → 修法，同症状累加次数
-index.json     代码索引（memo scan 产出）
+.gitignore     memo scan 建的：说明下面这份索引是本地缓存
+index.db       代码索引（memo scan 产出）——本地 SQLite，不进版本库
 ```
 
-纯文本、可 diff；写入为 tmp + rename；会写盘的子命令自动建目录。
+前三个是**记忆**：纯文本、可 diff、应当提交；写入是 tmp + rename，会写盘的子命令自动建目录。
+
+`index.db` 是**派生缓存**：里面每个字段都能从源码重建，所以它不进版本库——`memo scan` 会顺手写好 `.memo/.gitignore`（含 `index.db` 与 WAL 模式的两个旁文件）。新克隆或换机器后跑一次 `memo scan` 就有（600 文件约 0.6s）；直接 `memo find` 会明确让你先扫一次，而不是给你一份不知道多旧的答案。
+
 
 ## Memo 视图
 
@@ -73,13 +77,17 @@ index.json     代码索引（memo scan 产出）
 
 ## 已知限制
 
-- 不读 `.gitignore`：靠内置排除表 + `exclude`，所有点开头的目录一律跳过。
+- `.gitignore` 只读“一行一个名字”的那部分（`lib/`、`build`、`*.min.js`）：带斜杠的锚定模式、`!` 反选和嵌套 `.gitignore` 不管，点开头的目录一律跳过。
+- `memo find` 默认只展开首个命中的正文（约 80 行封顶），预算 2000 tokens；要更多用 `--bodies N` 或 `--full`。
 - `refresh` 用同步 `statSync`；大项目嫌贵可设 `refresh: false`。
-- `exact` 首次计数要解析 6MB 词表（约 150ms），之后常驻内存；默认 `estimated`。两种单位不能混进同一份 `index.json`。
+- `exact` 首次计数要解析 6MB 词表（约 150ms），之后常驻内存；默认 `estimated`，两种单位不能混进同一份索引。
+- 索引需要 Node ≥ 22.5 的 `node:sqlite`。没有它的运行时里 `scan` / `find` / `map` 会说明原因，而 `status` / `handoff` / `note` / `bug-*` 照常工作——它们本来就是纯文本。
+- 旧的 `.memo/index.json` 不再读写：可以直接删；提交过它的仓库用 `git rm --cached .memo/index.json` 取消跟踪。
 - `memo status` 和 `/memo` 不复核索引，报告的索引状态可能比磁盘略旧。
 - tree-sitter 是可选的：`web-tree-sitter` ^0.25 + `tree-sitter-wasm` 覆盖 JS/TS、Python、Go、Rust、GDScript 和 Godot `.tscn`/`.tres`。文件超过 500 tokens 才会解析；树里出现 ERROR 节点则整文件回退行内规则。
 - `/memo` 的面板路由没有鉴权，本机任何进程都能 `POST`；改动只进内存。
 - 语法写错时模型拿到用法说明而非参数校验错误；`memo help` 是语法的唯一出处。
+
 
 ## 开发
 
@@ -87,10 +95,12 @@ index.json     代码索引（memo scan 产出）
 npm install      # node_modules 不入库；tree-sitter 是 optional
 npm run build    # src/*.ts -> lib/*.js
 npm run check    # tsc --noEmit
-npm test         # build 后运行 102 个测试
+npm test         # build 后运行 111 个测试
 ```
 
-`src/` 是 TypeScript 源码，`lib/` 是 `npm run build` 的产物（不入库），`tokenizer/` 是随包的 DeepSeek V4 词表。`tsconfig.json` 开了 `strict`，但 `noImplicitAny` / `strictNullChecks` 暂关。
+`src/` 是 TypeScript 源码，`lib/` 是 `npm run build` 的产物（不入库），`tokenizer/` 是随包的 DeepSeek V4 词表。
+
+`src/db.ts` 是索引的存储层（本地 SQLite）：`src/indexer.ts` 负责提取与排序、产出内存里的索引，`db.ts` 负责把它落成行、做增量写回和全文检索。`tsconfig.json` 开了 `strict`，但 `noImplicitAny` / `strictNullChecks` 暂关。
 
 `test/tokenizer-vectors.json` 是 60 组逐 id 基准，由 HuggingFace `tokenizers` 读同一份词表生成。重建：
 

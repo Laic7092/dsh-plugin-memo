@@ -46,8 +46,9 @@ const FAMILY = {
 };
 
 /**
- * Node type -> symbol kind. A `null` kind means "decided by inspection"
- * (`variable_declarator` is a function only when its value is one).
+ * Node type -> symbol kind. A `null` kind means "decided by inspection": a
+ * `variable_declarator` is a function when its value is one, a module-level
+ * declaration otherwise, and nothing at all inside a function body.
  */
 const SPECS = {
   js: {
@@ -63,6 +64,8 @@ const SPECS = {
       method_signature: "method",
       public_field_definition: null,
       field_definition: null,
+      // null = decided by inspection: a function value is a function, a
+      // module-level one is a const, and a local is not a symbol at all.
       variable_declarator: null,
     },
     containers: {
@@ -77,7 +80,13 @@ const SPECS = {
     containers: { class_definition: "name" },
   },
   go: {
-    symbols: { function_declaration: "function", method_declaration: "method", type_spec: "type" },
+    symbols: {
+      function_declaration: "function",
+      method_declaration: "method",
+      type_spec: "type",
+      const_declaration: "const",
+      var_declaration: "var",
+    },
     containers: {},
   },
   rust: {
@@ -177,18 +186,44 @@ function collect(root, spec) {
  * cleared the moment the walk enters a function body, which is what keeps a
  * closure declared inside a method from being reported as a member of the class.
  */
+/**
+ * Which keyword opened the declaration a `variable_declarator` sits in, or
+ * null when it did not sit in one.
+ *
+ * The distinction is the whole point of remembering it: at the top level of a
+ * module a `const` *is* a declaration — it is what other files import — while
+ * a `const` inside a function body is a local the index would only be padding
+ * itself with. The grammar offers no node type for the difference (`const` and
+ * `let` are both `variable_declaration`), so the keyword itself is read.
+ */
+function declarationKind(node) {
+  const parent = node.parent;
+  if (parent === null || parent === undefined) return null;
+  if (parent.type !== "variable_declaration" && parent.type !== "lexical_declaration") return null;
+  // The keyword is the declaration node's own first token, and reading it is the
+  // only way to tell the three apart: the grammar spells both const and let as a
+  // lexical_declaration, and Go spells its const/var blocks as declaration nodes
+  // of their own.
+  const first = parent.firstChild;
+  return first !== null && first !== undefined && first.text === "const" ? "const" : "var";
+}
+
 function collectDeclarations(root, spec) {
   const symbols = [];
   const containers = spec.containers ?? {};
 
-  const visit = (node, owner) => {
+  const visit = (node, owner, inFunction) => {
     const declared = Object.prototype.hasOwnProperty.call(spec.symbols, node.type) ? spec.symbols[node.type] : undefined;
     let kind = declared;
     if (declared === null) {
       const value = node.childForFieldName("value");
+      // A declarator whose value is a function keeps the kind the regex pass
+      // gives the same line. Anything else is a module-level declaration only
+      // where it is actually module level; the rule is what keeps a function's
+      // internals out of the symbol list.
       kind = value !== null && value !== undefined && (spec.functionValues ?? new Set()).has(value.type)
         ? "function"
-        : undefined;
+        : (inFunction ? undefined : declarationKind(node));
     }
 
     const name = symbolName(node, spec);
@@ -215,10 +250,13 @@ function collectDeclarations(root, spec) {
     } else if (FUNCTION_LIKE.has(node.type)) {
       nextOwner = null;
     }
-    for (const child of node.namedChildren) visit(child, nextOwner);
+    // Sticky: once the walk is inside a body it stays there, and a nested
+    // function only ever re-enters a body it was already in.
+    const nextInFunction = inFunction === true || FUNCTION_LIKE.has(node.type);
+    for (const child of node.namedChildren) visit(child, nextOwner, nextInFunction);
   };
 
-  visit(root, null);
+  visit(root, null, false);
   return symbols;
 }
 

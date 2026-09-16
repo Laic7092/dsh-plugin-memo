@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { appendBug } from "../src/bugs.ts";
+import { closeDb, indexDbPath, openIndexDb } from "../src/db.ts";
 import { appendNote } from "../src/journal.ts";
 import { panelScan, panelState } from "../src/panel.ts";
 import { patchStatus, writeStatus } from "../src/status.ts";
@@ -22,10 +23,15 @@ function project() {
 /** The command catalogue as a flat list of names — what the card renders in rows. */
 const switchNames = (config) => config.subcommands.flatMap((group) => group.commands.map((entry) => entry.name));
 
-/** The per-file token counts as they landed in the project's index.json. */
-function indexedTokens(root) {
-  const index = JSON.parse(readFileSync(join(root, ".memo", "index.json"), "utf8"));
-  return index.files["src/a.ts"].tokens;
+/** The per-file token count as it landed in the project's index database. */
+async function indexedTokens(root) {
+  const opened = await openIndexDb(memoPaths(root, ".memo"));
+  assert.equal(opened.ok, true, "the fixture must have an index database");
+  try {
+    return Number(opened.db.prepare("SELECT tokens FROM files WHERE path = ?").get("src/a.ts").tokens);
+  } finally {
+    closeDb(opened.db);
+  }
 }
 
 /** Everything in `config` except the grouped command catalogue. */
@@ -165,7 +171,7 @@ test("panelScan counts exactly when the panel asks for it", async () => {
     const source = readFileSync(join(root, "src", "a.ts"), "utf8");
     const counted = loadTokenizer().encode(source).length;
     assert.notEqual(counted, Math.ceil(source.length / 4), "the fixture must tell the two counters apart");
-    assert.equal(indexedTokens(root), counted);
+    assert.equal(await indexedTokens(root), counted);
     // And the panel's own config echo carries the switch, so the card can state it.
     const state = await panelState(root, { tokenizer: "exact" }, null);
     assert.equal(state.config.tokenizer, "exact");
@@ -185,7 +191,7 @@ test("the panel revalidates in the counter it is told to, and says which one it 
 
     // Built the default way, and the panel reports the guess as a guess.
     await panelScan(root, {}, null);
-    assert.equal(indexedTokens(root), estimate);
+    assert.equal(await indexedTokens(root), estimate);
     const guessed = await panelState(root, {}, null);
     assert.equal(guessed.index.tokens, "estimated");
     assert.equal(guessed.index.totalTokens, estimate);
@@ -195,7 +201,7 @@ test("the panel revalidates in the counter it is told to, and says which one it 
     const switched = await panelState(root, { refresh: true, tokenizer: "exact" }, null);
     assert.equal(switched.index.tokens, "exact");
     assert.equal(switched.index.totalTokens, exact, "the number on screen is the new count");
-    assert.equal(indexedTokens(root), exact, "and it was written back, not just reported");
+    assert.equal(await indexedTokens(root), exact, "and it was written back, not just reported");
 
     // Back the other way needs no special case: the stamp decides.
     const back = await panelState(root, { refresh: true, tokenizer: "estimated" }, null);
@@ -229,7 +235,7 @@ test("panelScan writes an index, and refresh picks up a file nobody announced", 
     assert.equal(built.ok, true);
     assert.equal(built.index.fileCount, 1);
     assert.equal(typeof built.durationMs, "number");
-    assert.equal(isFile(paths.index), true);
+    assert.equal(isFile(indexDbPath(paths)), true);
 
     writeFileSync(join(root, "src", "b.ts"), "export function beta() {}\n", "utf8");
 

@@ -32,6 +32,7 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { isAbsolute, resolve } from "node:path";
 import { MEMO_COMMAND_NAMES, MEMO_COMMANDS, runMemo } from "./cli.ts";
+import { loadSqlite } from "./db.ts";
 import { panelConfig, panelScan, panelState } from "./panel.ts";
 import { createReadTracker, DEFAULT_READ_TOOLS, readTarget } from "./reads.ts";
 import { DEFAULT_DIR, statOrNull, stamp } from "./store.ts";
@@ -134,6 +135,16 @@ export function apply(ctx: any, config: MemoConfig = {}) {
     .then((analyzer) => {
       if (analyzer === null) log("code index: line-based extraction only (tree-sitter is unavailable)");
       else log(`code index: tree-sitter upgrade available for ${analyzer.grammars.join(", ")}`);
+    })
+    .catch(() => {});
+
+  // The index's own capability, probed and reported the same way: a runtime
+  // without node:sqlite loses the index commands, never the memory.
+  loadSqlite()
+    .then((DatabaseSync) => {
+      log(DatabaseSync === null
+        ? "code index: no node:sqlite in this runtime (Node >= 22.5) -- scan/find/map will say so; the memory commands are unaffected"
+        : "code index: SQLite index ready at <project>/.memo/index.db");
     })
     .catch(() => {});
 

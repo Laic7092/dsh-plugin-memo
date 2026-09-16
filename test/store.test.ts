@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { appendBug, loadBugs, normalizeSymptom, searchBugs } from "../src/bugs.ts";
 import { appendNote, readNotes } from "../src/journal.ts";
 import { patchStatus, parseStatus, readStatus, STATUS_SECTIONS } from "../src/status.ts";
-import { findProjectRoot, INDEX_MAX_BYTES, memoPaths, readJson, resolveInside } from "../src/store.ts";
+import { findProjectRoot, memoPaths, readJson, resolveInside } from "../src/store.ts";
 
 /** A project with the memory directory already created, as the host tools leave it. */
 function scratch() {
@@ -137,7 +137,7 @@ test("resolveInside refuses to escape the memory directory", () => {
 
 test("readJson only stops early when the caller asks for a small cap", () => {
   const { paths } = scratch();
-  const big = { version: 999, files: {}, note: "x".repeat(600_000) };
+  const big = { note: "x".repeat(600_000) };
   writeFileSync(paths.index, JSON.stringify(big), "utf8");
 
   // The default cap suits one source file, and a read that stopped early says
@@ -147,8 +147,9 @@ test("readJson only stops early when the caller asks for a small cap", () => {
   assert.equal(capped.present, true);
   assert.match(capped.error, /read cap/);
 
-  // The index is read under its own, larger cap, and arrives whole.
-  const whole = readJson(paths.index, null, INDEX_MAX_BYTES);
+  // A caller that knows its file is large passes its own cap, and the read
+  // arrives whole.
+  const whole = readJson(paths.index, null, 2 * 1024 * 1024);
   assert.equal(whole.ok, true);
   assert.equal(whole.value.note.length, 600_000);
 });

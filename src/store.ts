@@ -18,16 +18,13 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSy
 import { dirname, join, resolve, sep } from "node:path";
 
 export const DEFAULT_DIR = ".memo";
+/**
+ * The index database name inside the memory directory. What goes in it -- and
+ * why it is a database at all -- is the subject of \`./db.ts\`.
+ */
+export const DB_FILE = "index.db";
 export const FORMAT_VERSION = 1;
 export const DEFAULT_MAX_BYTES = 400_000;
-/**
- * The index is allowed to be far bigger than one source file, so it gets its
- * own ceiling. The two caps answer different questions -- "is this file worth
- * parsing" versus "is this index plausible" -- and folding them into one is
- * what silently truncated a 1.8 MB index into JSON that would not parse.
- */
-export const INDEX_MAX_BYTES = 8 * 1024 * 1024;
-
 /**
  * Where this call's project is.
  *
@@ -58,7 +55,10 @@ export function memoPaths(root, dirName = DEFAULT_DIR) {
     status: join(dir, "STATUS.md"),
     journal: join(dir, "journal.jsonl"),
     bugs: join(dir, "bugs.json"),
+    // The index moved to a local SQLite database. The old path stays because
+    // the migration message and the "your old one can go" hint still name it.
     index: join(dir, "index.json"),
+    db: join(dir, DB_FILE),
   };
 }
 
@@ -140,8 +140,7 @@ export function appendLine(file, line) {
 
 /**
  * maxBytes belongs to the caller: a truncated read is not JSON, so the cap
- * that suits one source file must not decide the index's fate. Readers of the
- * index pass INDEX_MAX_BYTES.
+ * that suits one source file must not decide a larger file's fate.
  */
 export function readJson(file, fallback = null, maxBytes = DEFAULT_MAX_BYTES) {
   const text = readText(file, maxBytes);

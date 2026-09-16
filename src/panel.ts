@@ -14,13 +14,14 @@
  *
  * @module dsh-plugin-memo/panel
  */
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { buildIndex, indexMeta, refreshIndex, staleFiles } from "./indexer.ts";
 import { recentBugs, loadBugs } from "./bugs.ts";
 import { readNotes } from "./journal.ts";
 import { readStatus, sectionBody, STATUS_SECTIONS } from "./status.ts";
 import { MEMO_COMMAND_GROUPS, MEMO_COMMAND_NAMES } from "./cli.ts";
-import { DEFAULT_DIR, INDEX_MAX_BYTES, findProjectRoot, isFile, memoPaths, readJson, statOrNull, writeJsonAtomic } from "./store.ts";
+import { DEFAULT_DIR, findProjectRoot, isFile, memoPaths, statOrNull } from "./store.ts";
+import { closeDb, dbStaleFiles, indexDbPath, indexDbStat, openIndexDb, readIndex, readIndexSummary, syncIndex, writeIndex } from "./db.ts";
 import type { MemoState, TsAnalyzer } from "./types.ts";
 
 /** How much of the journal and the bug log one panel render carries. */
@@ -50,34 +51,46 @@ function projectFor(root, dirName) {
 }
 
 /** The index as the panel needs it: counts, freshness, and nothing else. */
-function indexView(paths) {
-  if (!isFile(paths.index)) return { present: false };
-  const file = readJson(paths.index, null, INDEX_MAX_BYTES);
-  const value = file.ok ? file.value : null;
-  if (value === null || typeof value !== "object" || value.files === null || typeof value.files !== "object") {
-    return { present: true, readable: false, error: file.ok ? "index.json is not the shape this plugin writes" : file.error };
+/**
+ * The index as the panel needs it: counts, freshness, and nothing else.
+ *
+ * Answered from the database's own aggregates rather than by reconstructing the
+ * index: the panel wants five numbers and a staleness list, not the 12,000
+ * symbols it would immediately throw away.
+ */
+async function indexView(paths) {
+  const opened = await openIndexDb(paths);
+  if (!opened.ok) {
+    // A database that is not there yet is "no index"; one that is there and
+    // will not open is a reader that has to say why it has nothing.
+    return isFile(indexDbPath(paths)) ? { present: true, readable: false, error: opened.error } : { present: false };
   }
-  const stat = statOrNull(paths.index);
-  const meta = indexMeta(value);
-  const stale = staleFiles(value, 8);
-  return {
-    present: true,
-    readable: true,
-    bytes: stat === null ? null : stat.size,
-    scannedAt: meta.scannedAt ?? null,
-    fileCount: meta.fileCount,
-    symbolCount: meta.symbolCount,
-    totalTokens: meta.totalTokens,
-    // Which counter produced `totalTokens`. Without it the panel has a number
-    // and no idea whether it is a measurement or a guess.
-    tokens: meta.tokens,
-    symbolSource: value.symbolSource ?? "regex",
-    analyzerAvailable: value.analyzerAvailable === true,
-    staleChanged: stale.changedCount,
-    staleMissing: stale.missingCount,
-    staleChangedFiles: stale.changed,
-    staleMissingFiles: stale.missing,
-  };
+  try {
+    const meta = readIndexSummary(opened.db);
+    const stat = indexDbStat(paths);
+    const root = typeof meta.root === "string" && meta.root.length > 0 ? meta.root : dirname(paths.dir);
+    const stale = dbStaleFiles(opened.db, root, 8);
+    return {
+      present: true,
+      readable: true,
+      bytes: stat === null ? null : stat.bytes,
+      scannedAt: meta.scannedAt,
+      fileCount: meta.fileCount,
+      symbolCount: meta.symbolCount,
+      totalTokens: meta.totalTokens,
+      // Which counter produced that total. Without it the panel has a number
+      // and no idea whether it is a measurement or a guess.
+      tokens: meta.tokens,
+      symbolSource: meta.symbolSource,
+      analyzerAvailable: meta.analyzerAvailable,
+      staleChanged: stale.changedCount,
+      staleMissing: stale.missingCount,
+      staleChangedFiles: stale.changed,
+      staleMissingFiles: stale.missing,
+    };
+  } finally {
+    closeDb(opened.db);
+  }
 }
 
 /**
@@ -99,17 +112,23 @@ export async function panelState(root: string | null, options: Partial<MemoState
 
   // The panel is the one surface that shows the index without spending a model
   // turn, so it revalidates when asked — the same sweep `memo find` does.
-  if (options.refresh === true && isFile(paths.index)) {
-    const loaded = readJson(paths.index, null, INDEX_MAX_BYTES);
-    if (loaded.ok && loaded.value !== null && typeof loaded.value === "object") {
+  if (options.refresh === true) {
+    const opened = await openIndexDb(paths);
+    if (opened.ok) {
       try {
-        // `options.tokenizer` is the host's live counter here, not a default:
-        // this is the same sweep `memo find` runs, and an index counted in the
-        // other unit has to be rebuilt rather than reused.
-        const fresh = await refreshIndex(loaded.value, { exclude: options.exclude, analyzer, tokenizer: options.tokenizer });
-        if (fresh.changed > 0) writeJsonAtomic(paths.index, fresh.index);
+        const loaded = readIndex(opened.db);
+        // The live counter, not a default: this is the same sweep memo find
+        // runs, and an index counted in the other unit has to be rebuilt rather
+        // than reused.
+        const fresh = loaded === null ? null : await refreshIndex(loaded, { exclude: options.exclude, analyzer, tokenizer: options.tokenizer });
+        if (fresh !== null && fresh.changed > 0) {
+          if (fresh.rebuilt === true) writeIndex(opened.db, fresh.index);
+          else syncIndex(opened.db, fresh.index, { added: fresh.added, updated: fresh.updated, removed: fresh.removed });
+        }
       } catch {
         // A refresh that fails must not take the panel down with it.
+      } finally {
+        closeDb(opened.db);
       }
     }
   }
@@ -118,7 +137,7 @@ export async function panelState(root: string | null, options: Partial<MemoState
     ok: true,
     root: project.root,
     dir: dirName,
-    initialized: isFile(paths.status) || isFile(paths.journal) || isFile(paths.bugs) || isFile(paths.index),
+    initialized: isFile(paths.status) || isFile(paths.journal) || isFile(paths.bugs) || isFile(indexDbPath(paths)),
     status: {
       present: status.present,
       updated: status.updated ?? null,
@@ -149,7 +168,7 @@ export async function panelState(root: string | null, options: Partial<MemoState
         fix: bug.fix ?? null,
       })),
     },
-    index: indexView(paths),
+    index: await indexView(paths),
     // The switches travel with the state the panel is looking at, so the card
     // always has the host's live values and never needs a second request just to
     // render itself.
@@ -214,7 +233,14 @@ export async function panelScan(root: string | null, options: Partial<MemoState>
     analyzer,
     tokenizer: options.tokenizer,
   });
-  const write = writeJsonAtomic(paths.index, index);
-  if (!write.ok) return { ok: false, error: write.error, root: project.root };
+  const opened = await openIndexDb(paths, { create: true });
+  if (!opened.ok) return { ok: false, error: opened.error, root: project.root };
+  try {
+    writeIndex(opened.db, index);
+  } catch (error) {
+    return { ok: false, error: error && error.message ? error.message : String(error), root: project.root };
+  } finally {
+    closeDb(opened.db);
+  }
   return { ok: true, root: project.root, durationMs: Date.now() - started, index: indexMeta(index) };
 }
